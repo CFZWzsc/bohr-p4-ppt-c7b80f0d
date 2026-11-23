@@ -1,0 +1,23 @@
+{
+ "case_id": "demo-case-0001",
+ "topic_id": "ppt-c7b80f0d",
+ "topic_title": "论文转学术 PPT",
+ "difficulty": 1,
+ "domain": "slides",
+ "task_instruction": "演示用例：请读取同目录下的材料文件，给出带原文证据的结论，并把无法判断的部分写入 uncertainties。",
+ "output_contract": {
+  "slide_outline": "可编辑演示文件 :: 页级结构、主张、图表、讲稿/备注和模板结果；完成标准：能围绕论文主线讲清楚",
+  "page_evidence_map": "页级证据映射 :: 每页内容对应论文图、表、章节或数据；完成标准：引用准确，未改写事实",
+  "render_and_version_log": "渲染与版本记录 :: 源文件、导出件、字体/模板和修改记录；完成标准：可打开、播放、编辑并复核",
+  "case_id": "",
+  "compliance_checks": "",
+  "content_map": "",
+  "editable_source": "",
+  "exceptions": "",
+  "export_artifact": "",
+  "status": ""
+ },
+ "evaluation": {
+  "mode": "demo"
+ }
+}
