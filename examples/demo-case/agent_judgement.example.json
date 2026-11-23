@@ -1,0 +1,36 @@
+{
+  "_comment": [
+    "阶段 B 的判断文件模板。复制到 /app/work/agent_judgement.json 后按实际材料填写。",
+    "quote 必须是材料里的逐字片段 —— 脚本会逐条校验，找不到就退回。",
+    "case_id 必须与 /input/case.json 里的 case_id 一致。"
+  ],
+  "case_id": "<与 /input/case.json 一致>",
+  "claims": [
+    {
+      "text": "<你判断为结论的陈述，用材料里的事实支撑>",
+      "kind": "reported",
+      "evidence": [
+        {"paragraph_id": "P002", "quote": "<材料里逐字出现的片段>"}
+      ]
+    }
+  ],
+  "answers": [
+    {
+      "question": "<被问的问题>",
+      "answer": "<你的回答>",
+      "evidence": [
+        {"paragraph_id": "P002", "quote": "<材料里逐字出现的片段>"}
+      ]
+    }
+  ],
+  "deliverable": "<本题最终交付物的正文>",
+  "contract_fields": {},
+  "uncertainties": [
+    {
+      "kind": "<machine_readable_category>",
+      "item": "<具体对象>",
+      "detail": "<客观描述>",
+      "resolution": "<你做了什么，或为何无法继续>"
+    }
+  ]
+}
