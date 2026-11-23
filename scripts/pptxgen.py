@@ -2,11 +2,11 @@
 
 做什么
 ------
-1. `build_pages()` —— 从材料段落组织**逐页大纲**：
-   * 把每个 section（= 一段材料）的句子按**每页最多 4 条要点**分页；
-     一个 section 句子多时拆成多页，页标题用该 section 的**原句首句**（逐字）。
-   * 每条要点都是**材料原句的逐字片段**（只截断、不改写、不编造）。
-   * 结尾追加「要点回顾」页（各 section 首句 + 来源段落标注）与「阅读提示」页。
+1. `build_pages()` —— 从材料段落组织**按叙事角色分页**的大纲：
+   * 先判断每句承担的叙事角色（研究问题 / 方法路线 / 关键结果 / 讨论与含义 /
+     局限与结论），再按角色成页；页标题就是该页承担的叙事角色。
+   * 每条要点都是**材料原句的逐字片段**（只截断、不改写、不编造）；
+     判不出角色的句子按段落顺序兜底成「研究内容」页。
    * 页数上限 `max_pages`（默认 12）仍然生效，被截断时**如实记录**。
    * 每页的**讲稿备注单独生成**，与页面文字物理分离。
 2. `write_slides_artifacts()` —— 落盘：
@@ -50,7 +50,7 @@ from typing import Any
 
 import artifacts as A
 
-PPTX_VERSION = "1.1.0"
+PPTX_VERSION = "1.2.0"
 
 # 16:9 幻灯片（EMU）
 SLIDE_W = 12192000
@@ -106,7 +106,11 @@ def _esc(text: str) -> str:
 # 逐页大纲
 # ---------------------------------------------------------------------------
 
-_SENT_SPLIT = re.compile(r"(?<=[。！？；!?;])\s*")
+_SENT_SPLIT = re.compile(
+    r"(?<=[。！？；!?;])\s*"          # 中文/英文句末标点后切
+    r"|(?<=[.])\s+(?=[A-Z(（])"      # 英文句号 + 空格 + 大写开头（避开 Fig. 2）
+    r"|[\r\n]+"                      # 材料里的硬换行本身也是句界
+)
 
 
 def _split_sentences(text: str) -> list[str]:
@@ -121,98 +125,265 @@ def _clip(text: str, limit: int) -> str:
     return s if len(s) <= limit else s[:limit]
 
 
-def build_pages(paras: list[dict[str, Any]],
-                task_instruction: str = "",
-                max_pages: int = 12) -> list[dict[str, Any]]:
-    """把材料组织成逐页大纲（标题 / 要点 / 来源 / 讲稿分离）。
+ROLE_ORDER = ("研究问题", "方法路线", "关键结果", "讨论与含义", "局限与结论")
 
-    分页依据是**材料里真实存在的句子**：一个 section 的句子按每页
-    最多 `MAX_BULLETS_PER_PAGE` 条切分，标题取该 section 的首句原文。
-    所有要点都是原文的逐字片段，绝不改写、绝不补写材料里没有的内容。
-    """
-    max_pages = max(1, int(max_pages or 12))
+# 叙事角色 → 线索词。角色判定用**材料原句**匹配，判不出来时按段落顺序兜底，
+# 绝不为了凑角色而补写材料里没有的内容。
+_ROLE_CUES: dict[str, tuple[str, ...]] = {
+    "研究问题": (
+        r"本研究|本工作|本文", r"研究(问题|目的|目标|背景)",
+        r"我们(提出|研究|报告|设计|开发)",
+        r"aim|objective|goal|hypothes|we (ask|investigate|report|propose|address)",
+        r"challenge|problem|question|关键问题|亟需|尚未解决",
+    ),
+    "方法路线": (
+        r"方法|材料与方法|实验(设计|流程|步骤|方法)", r"制备|合成|表征|测试|测量|培养|处理",
+        r"采用|使用|通过|按照", r"we (used|prepared|measured|performed|conducted|"
+        r"synthesi[sz]ed|collected)",
+        r"method|protocol|instrument|procedure|workflow",
+    ),
+    "关键结果": (
+        r"结果|数据(表明|显示)", r"表明|显示|观察到", r"提高|降低|增加|减少|提升|下降",
+        r"降至|升至|达到|超过",
+        r"图\s*\d|表\s*\d|Figure|Table",
+        r"retained|improved|increased|decreased|reduced|yield|efficiency|capacity|"
+        r"significant",
+    ),
+    "讨论与含义": (
+        r"讨论", r"机制|解释|原因|可能|推测", r"一致|支持|证实|符合", r"说明",
+        r"suggest|indicat|consistent with|mechanism|implies|explain",
+    ),
+    "局限与结论": (
+        r"局限|不足|限制|未来(工作|研究)", r"结论|总之|综上|因此",
+        r"尚未|未评估|有待",
+        r"limitation|future work|conclusion|in summary|we conclude|taken together",
+    ),
+}
 
-    sections: list[dict[str, Any]] = []
+_ROLE_NOTES = {
+    "标题": "开场：一句话说明汇报主题与材料来源；页脚段落编号用于回查原文。",
+    "研究问题": "先交代要回答的问题与动机，再说明为什么值得做；这一页不提前念结果。",
+    "方法路线": "按材料顺序讲方法与步骤，强调关键条件与对照；具体数字留到结果页再念。",
+    "关键结果": "先讲趋势，再用页脚段落编号定位的数值支撑；不逐字念整句。",
+    "讨论与含义": "把结果与机制/解释连起来，明确区分材料写明的结论与仍需推断的部分。",
+    "局限与结论": "明确边界、局限与结论；需要补充的实验或材料在备注里点名。",
+}
+
+
+def _looks_like_heading(text: str) -> bool:
+    s = (text or "").strip()
+    if not s:
+        return True
+    if re.match(r"^#{1,6}\s+\S", s):
+        return True
+    if len(s) <= 60 and not re.search(r"[。.!?！？；;：:]$", s) and \
+            re.match(r"^(第[一二三四五六七八九十百\d]+[章节部分节]|"
+                     r"\d+(\.\d+)*[.、]?\s|[一二三四五六七八九十]+[、.．]|"
+                     r"[A-Z][A-Za-z ]{2,40}$)", s):
+        return True
+    return False
+
+
+def _sentences_with_source(paras: list[dict[str, Any]]) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
     for p in paras:
         text = (p.get("text") or "").strip()
         if not text:
             continue
-        sents = _split_sentences(text)
-        if not sents:
-            sents = [text]
-        sections.append({
-            "paragraph_id": p.get("paragraph_id", ""),
-            "source_id": p.get("source_id", ""),
-            "sentences": sents,
-            "text": text,
-        })
+        raw_sents = _split_sentences(text)
+        if not raw_sents:
+            raw_sents = [text]
+        for sent in raw_sents:
+            s = (sent or "").strip()
+            if len(s) < 8 or _looks_like_heading(s):
+                continue
+            if s in seen:
+                continue
+            seen.add(s)
+            out.append({
+                "text": s,
+                "paragraph_id": p.get("paragraph_id", ""),
+                "source_id": p.get("source_id", ""),
+                "para_text": text,
+            })
+    return out
 
-    # ---- 页数预算：概览 + 正文 + 要点回顾 + 阅读提示 -----------------------
-    head: list[dict[str, Any]] = []
-    tail: list[dict[str, Any]] = []
-    if task_instruction:
-        head.append(_overview_page(task_instruction, sections))
-    if sections:
-        tail.extend(_recap_pages(sections))
-    tail.append(_guide_page())
 
-    # 页数上限太小：先砍附加页（阅读提示 → 要点回顾），再砍概览页；
-    # 但只要有材料，正文至少留一页。
-    dropped_tail = 0
-    budget = max_pages - len(head) - len(tail)
-    while budget < 0 and len(tail) > 0:
-        tail.pop()
-        dropped_tail += 1
-        budget = max_pages - len(head) - len(tail)
-    if budget < 0 and head:
-        head = []
-        budget = max_pages - len(tail)
-    if sections and budget < 1 and tail:
-        tail.pop()
-        dropped_tail += 1
-        budget = max_pages - len(head) - len(tail)
+_NUMERIC_RE = re.compile(
+    r"\d+(?:\.\d+)?\s*(?:%|％|h\b|hr|hours?|min\b|ms\b|s\b|Ω|ohm|nm|μm|um\b|mm\b|"
+    r"cm|mA|A/g|W\b|kW|mg|kg|mL|mol|eV|keV|Hz|kHz|MHz|V\b|mV|°C|℃|K\b)",
+    re.IGNORECASE)
 
-    # ---- 正文页：section → 句子分块 → 每页 ≤4 条要点 -----------------------
+
+def _role_of(sentence: str) -> str:
+    """按线索词打分判角色；同分时优先更具体的角色。
+
+    结果页的线索（“降低/提高/数字”）也常出现在讨论句里，所以不能简单地
+    按固定顺序取第一个命中；这里每个角色统计命中线索数，同分时按
+    「局限 > 讨论 > 研究问题 > 方法 > 结果」取更具体的角色。含数字+单位的
+    句子在没有其他线索时归入结果页（是数据，不是背景）。
+    """
+    low = sentence.lower()
+    scores: dict[str, int] = {}
+    for role in ROLE_ORDER:
+        n = sum(1 for cue in _ROLE_CUES[role]
+                if re.search(cue, low, re.IGNORECASE))
+        if n:
+            scores[role] = n
+    if "关键结果" not in scores and _NUMERIC_RE.search(sentence):
+        scores["关键结果"] = 1
+    if not scores:
+        return ""
+    tie = {"局限与结论": 0, "讨论与含义": 1, "研究问题": 2,
+           "方法路线": 3, "关键结果": 4}
+    return sorted(scores, key=lambda r: (-scores[r], tie[r]))[0]
+
+
+
+def build_pages(paras: list[dict[str, Any]],
+                task_instruction: str = "",
+                case: dict[str, Any] | None = None,
+                max_pages: int = 12) -> list[dict[str, Any]]:
+    """把材料组织成**按叙事角色分页**的学术演示大纲。
+
+    与「一段一页」的机械切分不同，这一版先判断每句承担的叙事角色
+    （研究问题 / 方法路线 / 关键结果 / 讨论与含义 / 局限与结论），再按角色
+    成页；每页的标题就是它在汇报里承担的角色，要点仍是材料原句的逐字片段，
+    页级证据映射写回段落编号。判不出角色的句子按段落顺序兜底成「研究内容」，
+    绝不改写、补写或编造。
+    """
+    max_pages = max(3, int(max_pages or 12))
+    sents = _sentences_with_source(paras)
+
+    by_role: dict[str, list[dict[str, str]]] = {r: [] for r in ROLE_ORDER}
+    unassigned: list[dict[str, str]] = []
+    for s in sents:
+        role = _role_of(s["text"])
+        if role:
+            s["role"] = role
+            by_role[role].append(s)
+        else:
+            s["role"] = ""
+            unassigned.append(s)
+
+    # 每类角色的取句上限：报告不是逐段复述，结果页可以多，背景/讨论页要克制。
+    caps = {"研究问题": 4, "方法路线": 6, "关键结果": 8,
+            "讨论与含义": 4, "局限与结论": 6}
+    for role, cap in caps.items():
+        by_role[role] = by_role[role][:cap]
+
+    # ---- 首页：标题页（主题 + 一句材料原句） ------------------------------
+    title = str((case or {}).get("topic_title") or (case or {}).get("title") or "").strip()
+    if not title:
+        title = "学术汇报"
+    head_sent = (sents[0] if sents else None)
+    head: list[dict[str, Any]] = [{
+        "title": _clip(title, MAX_TITLE_CHARS),
+        "title_suffix": "",
+        "role": "标题",
+        "bullets": ([_clip(head_sent["text"], MAX_BULLET_CHARS)] if head_sent
+                    else [_clip(task_instruction, MAX_BULLET_CHARS)] if task_instruction
+                    else ["（材料中没有可引用的主题句）"]),
+        "bullet_annotations": [head_sent["paragraph_id"] if head_sent else ""],
+        "bullet_source_texts": [head_sent["para_text"] if head_sent else ""],
+        "source_paragraph_id": head_sent["paragraph_id"] if head_sent else "",
+        "source_id": head_sent["source_id"] if head_sent else "",
+        "quote": _clip(head_sent["text"], 200) if head_sent else "",
+        "notes": _ROLE_NOTES["标题"] + (
+            f" 来源段落：{head_sent['paragraph_id']}。" if head_sent else ""),
+        "kind": "title",
+        "section_part": 1,
+        "section_parts": 1,
+        "max_bullets": 1,
+    }] if sents or task_instruction else []
+
+    # ---- 正文页：角色 → 每页 ≤4 条要点 ------------------------------------
     content: list[dict[str, Any]] = []
-    dropped_sections: list[str] = []
-    dropped_sentences = 0
-    dropped_pages = 0
-    for sec in sections:
-        title_text = _clip(sec["sentences"][0], MAX_TITLE_CHARS)
-        # 标题已是首句，正文要点不再重复首句（材料只有一个句子时例外）
-        body_sents = sec["sentences"][1:] if len(sec["sentences"]) > 1 else sec["sentences"]
-        chunks = [body_sents[i:i + MAX_BULLETS_PER_PAGE]
-                  for i in range(0, len(body_sents), MAX_BULLETS_PER_PAGE)]
+    for role in ROLE_ORDER:
+        items = by_role[role]
+        if not items:
+            continue
+        chunks = [items[i:i + MAX_BULLETS_PER_PAGE]
+                  for i in range(0, len(items), MAX_BULLETS_PER_PAGE)]
         for ci, chunk in enumerate(chunks):
-            if len(content) >= budget:
-                dropped_pages += 1
-                dropped_sentences += len(chunk)
-                if sec["paragraph_id"] not in dropped_sections:
-                    dropped_sections.append(sec["paragraph_id"])
-                continue
-            bullets = [_clip(s, MAX_BULLET_CHARS) for s in chunk]
-            bullets = [b for b in bullets if b]
-            if not bullets:
-                continue
-            total_parts = len(chunks)
+            pids: list[str] = []
+            for it in chunk:
+                if it["paragraph_id"] and it["paragraph_id"] not in pids:
+                    pids.append(it["paragraph_id"])
             content.append({
-                "title": title_text,
-                "title_suffix": (f"〔续 {ci + 1}/{total_parts}〕" if total_parts > 1 else ""),
-                "bullets": bullets,
-                "bullet_annotations": [sec["paragraph_id"] or ""] * len(bullets),
-                # 该页每条要点对应的**材料原段落全文**，用于逐字回查
-                "bullet_source_texts": [sec["text"]] * len(bullets),
-                "source_paragraph_id": sec["paragraph_id"],
-                "source_id": sec["source_id"],
-                "quote": _clip(sec["sentences"][0], 200),
-                "notes": _notes_for_section(sec, ci + 1, total_parts, len(bullets)),
+                "title": role,
+                "title_suffix": (f"〔续 {ci + 1}/{len(chunks)}〕"
+                                 if len(chunks) > 1 else ""),
+                "role": role,
+                "bullets": [_clip(it["text"], MAX_BULLET_CHARS) for it in chunk],
+                "bullet_annotations": [it["paragraph_id"] for it in chunk],
+                "bullet_source_texts": [it["para_text"] for it in chunk],
+                "source_paragraph_id": pids[0] if pids else "",
+                "source_paragraph_ids": pids,
+                "source_id": chunk[0]["source_id"],
+                "quote": _clip(chunk[0]["text"], 200),
+                "notes": _ROLE_NOTES[role] + f" 来源段落：{'、'.join(pids)}。",
                 "kind": "content",
                 "section_part": ci + 1,
-                "section_parts": total_parts,
+                "section_parts": len(chunks),
                 "max_bullets": MAX_BULLETS_PER_PAGE,
             })
 
-    pages = head + content + tail
+    # ---- 兜底：角色线索全判不出时，按段落顺序成「研究内容」页 -------------
+    if len(content) < 2 and unassigned:
+        chunks = [unassigned[i:i + MAX_BULLETS_PER_PAGE]
+                  for i in range(0, len(unassigned), MAX_BULLETS_PER_PAGE)]
+        for ci, chunk in enumerate(chunks):
+            pids = []
+            for it in chunk:
+                if it["paragraph_id"] and it["paragraph_id"] not in pids:
+                    pids.append(it["paragraph_id"])
+            content.append({
+                "title": "研究内容",
+                "title_suffix": (f"〔续 {ci + 1}/{len(chunks)}〕"
+                                 if len(chunks) > 1 else ""),
+                "role": "研究内容",
+                "bullets": [_clip(it["text"], MAX_BULLET_CHARS) for it in chunk],
+                "bullet_annotations": [it["paragraph_id"] for it in chunk],
+                "bullet_source_texts": [it["para_text"] for it in chunk],
+                "source_paragraph_id": pids[0] if pids else "",
+                "source_paragraph_ids": pids,
+                "source_id": chunk[0]["source_id"],
+                "quote": _clip(chunk[0]["text"], 200),
+                "notes": ("按材料顺序交代研究内容；每页页脚给出可回查的段落编号。"
+                          f" 来源段落：{'、'.join(pids)}。"),
+                "kind": "content",
+                "section_part": ci + 1,
+                "section_parts": len(chunks),
+                "max_bullets": MAX_BULLETS_PER_PAGE,
+            })
+
+    pages = head + content
+
+    # ---- 页数上限：超限时砍尾部正文页，并在最后一页如实登记截断 ----------
+    dropped_pages = 0
+    dropped_sentences = 0
+    if len(pages) > max_pages:
+        while len(pages) > max_pages and len(pages) > len(head) + 1:
+            removed = pages.pop()
+            dropped_pages += 1
+            dropped_sentences += len(removed.get("bullets") or [])
+        if dropped_pages:
+            last = None
+            for page in pages:
+                if page.get("kind") == "content":
+                    last = page
+            if last is not None:
+                last["truncated"] = True
+                last["truncation"] = {
+                    "max_pages": max_pages,
+                    "dropped_pages": dropped_pages,
+                    "dropped_sentences": dropped_sentences,
+                    "reason": ("max_pages 上限导致尾部正文页未写入 deck；"
+                               "被截断的要点未写入，也未改写成摘要"),
+                }
+
     for i, page in enumerate(pages, start=1):
         page["page"] = i
         page.setdefault("truncated", False)
@@ -223,141 +394,11 @@ def build_pages(paras: list[dict[str, Any]],
         page.setdefault("quote", "")
         page.setdefault("notes", "")
         page.setdefault("kind", "content")
+        page.setdefault("role", "研究内容")
         page["max_bullets"] = max(1, int(page.get("max_bullets")
                                         or len(page.get("bullets") or []) or 1))
         page["has_notes"] = bool(page.get("notes"))
-
-    # ---- 截断如实记录 ------------------------------------------------------
-    if dropped_pages or dropped_sections:
-        detail = {
-            "max_pages": max_pages,
-            "dropped_pages": dropped_pages,
-            "dropped_sections": dropped_sections,
-            "dropped_sentences": dropped_sentences,
-            "reason": ("max_pages 上限导致部分 section 未全部展开；"
-                       "被截断的要点未写入 deck"),
-        }
-        last_content = None
-        for page in pages:
-            if page.get("kind") == "content":
-                last_content = page
-        if last_content is not None:
-            last_content["truncated"] = True
-            last_content["truncation"] = detail
     return pages
-
-
-def _overview_page(task_instruction: str,
-                   sections: list[dict[str, Any]]) -> dict[str, Any]:
-    """首页：任务与范围（指令逐字引用，不改写）。"""
-    return {
-        "title": "研究概览",
-        "title_suffix": "",
-        "bullets": [_clip(task_instruction, MAX_BULLET_CHARS)],
-        "bullet_annotations": [""],
-        "source_paragraph_id": sections[0]["paragraph_id"] if sections else "",
-        "source_id": sections[0]["source_id"] if sections else "",
-        "quote": _clip(sections[0]["sentences"][0], 160) if sections else "",
-        "notes": ("开场页：先用一句话交代这次演示要回答的问题和材料的范围，"
-                  "再说明全篇结构——正文每一页对应材料中的一段原文要点，"
-                  "页脚标出来源段落编号。"),
-        "kind": "overview",
-        "section_part": 1,
-        "section_parts": 1,
-    }
-
-
-def _recap_pages(sections: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """要点回顾：各 section 的首句原句 + 来源段落标注。
-
-    首句一条都不丢：section 多于 `RECAP_MAX_BULLETS` 时拆成多页，
-    页标题带「〔续 k/m〕」，保证「每个 section 的首句都能逐字找回」。
-    """
-    items: list[tuple[str, str, str]] = []
-    for sec in sections:
-        first = _clip(sec["sentences"][0], MAX_BULLET_CHARS)
-        if not first:
-            continue
-        items.append((first, sec["paragraph_id"] or "", sec["text"]))
-    if not items:
-        return [{
-            "title": "要点回顾",
-            "title_suffix": "",
-            "bullets": ["（材料中没有可用于回顾的段落）"],
-            "bullet_annotations": [""],
-            "bullet_source_texts": [""],
-            "source_paragraph_id": "",
-            "source_id": "",
-            "source_paragraph_ids": [],
-            "quote": "",
-            "notes": "回顾页：材料里没有可回顾的段落，需要补充材料后重新生成。",
-            "kind": "recap",
-            "section_part": 1,
-            "section_parts": 1,
-            "max_bullets": 1,
-        }]
-
-    chunks = [items[i:i + RECAP_MAX_BULLETS]
-              for i in range(0, len(items), RECAP_MAX_BULLETS)]
-    pages: list[dict[str, Any]] = []
-    for ci, chunk in enumerate(chunks):
-        pages.append({
-            "title": "要点回顾",
-            "title_suffix": (f"〔续 {ci + 1}/{len(chunks)}〕"
-                             if len(chunks) > 1 else ""),
-            "bullets": [c[0] for c in chunk],
-            "bullet_annotations": [c[1] for c in chunk],
-            "bullet_source_texts": [c[2] for c in chunk],
-            "source_paragraph_id": "",
-            "source_id": "",
-            "source_paragraph_ids": [c[1] for c in chunk],
-            "quote": "",
-            "notes": ("回顾页：把每个段落的首句串起来讲一遍，作为全文主线。"
-                      "这一页不展开细节，目的是让听众先拿到整体结论，"
-                      "再回到正文页看支撑材料。"),
-            "kind": "recap",
-            "section_part": ci + 1,
-            "section_parts": len(chunks),
-            "max_bullets": len(chunk),
-        })
-    return pages
-
-
-def _guide_page() -> dict[str, Any]:
-    """阅读提示：说明本 deck 每页都带来源段落与讲稿备注。"""
-    bullets = [
-        "每一页页脚都标注来源段落编号与来源文件，可回材料逐句核对。",
-        "每页要点均为材料原句的逐字片段，只截断、不改写、不补写。",
-        "每页配有讲稿备注，只写在备注视图与 speaker-notes.md，不进入页面文字。",
-        "deck.pptx 为可编辑演示文稿，slides/slide-NN.svg 为每页矢量源。",
-    ]
-    return {
-        "title": "阅读提示",
-        "title_suffix": "",
-        "bullets": bullets,
-        "bullet_annotations": [""] * len(bullets),
-        "source_paragraph_id": "",
-        "source_id": "",
-        "quote": "",
-        "notes": ("说明页：不必逐条念，用半分钟交代全篇的走法——先概览，"
-                  "再按材料顺序讲正文，最后收在回顾页；"
-                  "听众追问某个数字时，翻到对应页的页脚按编号回查原始材料。"),
-        "kind": "reading_guide",
-        "section_part": 1,
-        "section_parts": 1,
-        "max_bullets": 4,
-    }
-
-
-def _notes_for_section(sec: dict[str, Any], part: int, parts: int,
-                       n_bullets: int) -> str:
-    """讲稿备注：**不复述页面要点**，只讲怎么讲、去哪核对。"""
-    pid = sec.get("paragraph_id", "") or "未标注"
-    where = "这一页" if parts <= 1 else f"这一页是本节的第 {part}/{parts} 页"
-    return (f"{where}，覆盖材料段落 {pid}，共 {n_bullets} 条要点。"
-            "讲法建议：先用标题句点出这一段在方法链条中的位置，"
-            "再按页面顺序把要点逐条讲完，重点展开其中一条的因果关系。"
-            "所有要点都是原文原句，页脚标出来源段落编号，可回材料逐句核对。")
 
 
 # ---------------------------------------------------------------------------
@@ -1417,6 +1458,7 @@ def write_slides_artifacts(out_dir: str, pages: list[dict[str, Any]],
         "pages": [{
             "page": p.get("page"),
             "kind": p.get("kind", "content"),
+            "role": p.get("role", ""),
             "title": p.get("title", ""),
             "paragraph_id": p.get("source_paragraph_id", ""),
             "source_id": p.get("source_id", ""),
@@ -1456,6 +1498,7 @@ def write_slides_artifacts(out_dir: str, pages: list[dict[str, Any]],
     return {
         "files": files,
         "pages": len(pages),
+        "page_plan": pages,
         "renders": renders,
         "exports": {
             "deck_pptx": pptx_record,
