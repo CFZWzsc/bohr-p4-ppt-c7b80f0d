@@ -818,28 +818,35 @@ def _app_props(n_slides: int) -> str:
             f'<Slides>{n_slides}</Slides></Properties>')
 
 
+def _zwrite(z: zipfile.ZipFile, name: str, data: str) -> None:
+    """写 zip 条目时固定时间戳，保证同一输入多次构建逐字节一致。"""
+    info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+    info.compress_type = zipfile.ZIP_DEFLATED
+    zipfile.ZipFile.writestr(z, info, data)
+
+
 def write_pptx(path: str, pages: list[dict[str, Any]], case: dict[str, Any]) -> None:
     """写出真实可编辑的 PPTX。"""
     n = len(pages)
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr("[Content_Types].xml", _content_types(n))
-        z.writestr("_rels/.rels", _root_rels())
-        z.writestr("docProps/core.xml", _core_props(case))
-        z.writestr("docProps/app.xml", _app_props(n))
-        z.writestr("ppt/presentation.xml", _presentation_xml(n))
-        z.writestr("ppt/_rels/presentation.xml.rels", _presentation_rels(n))
-        z.writestr("ppt/slideMasters/slideMaster1.xml", _slide_master())
-        z.writestr("ppt/slideMasters/_rels/slideMaster1.xml.rels", _slide_master_rels())
-        z.writestr("ppt/slideLayouts/slideLayout1.xml", _slide_layout())
-        z.writestr("ppt/slideLayouts/_rels/slideLayout1.xml.rels", _slide_layout_rels())
-        z.writestr("ppt/notesMasters/notesMaster1.xml", _notes_master())
-        z.writestr("ppt/notesMasters/_rels/notesMaster1.xml.rels", _notes_master_rels())
-        z.writestr("ppt/theme/theme1.xml", _theme())
+        _zwrite(z, "[Content_Types].xml", _content_types(n))
+        _zwrite(z, "_rels/.rels", _root_rels())
+        _zwrite(z, "docProps/core.xml", _core_props(case))
+        _zwrite(z, "docProps/app.xml", _app_props(n))
+        _zwrite(z, "ppt/presentation.xml", _presentation_xml(n))
+        _zwrite(z, "ppt/_rels/presentation.xml.rels", _presentation_rels(n))
+        _zwrite(z, "ppt/slideMasters/slideMaster1.xml", _slide_master())
+        _zwrite(z, "ppt/slideMasters/_rels/slideMaster1.xml.rels", _slide_master_rels())
+        _zwrite(z, "ppt/slideLayouts/slideLayout1.xml", _slide_layout())
+        _zwrite(z, "ppt/slideLayouts/_rels/slideLayout1.xml.rels", _slide_layout_rels())
+        _zwrite(z, "ppt/notesMasters/notesMaster1.xml", _notes_master())
+        _zwrite(z, "ppt/notesMasters/_rels/notesMaster1.xml.rels", _notes_master_rels())
+        _zwrite(z, "ppt/theme/theme1.xml", _theme())
         for i, page in enumerate(pages, start=1):
-            z.writestr(f"ppt/slides/slide{i}.xml", _slide_xml(page))
-            z.writestr(f"ppt/slides/_rels/slide{i}.xml.rels", _slide_rels(i))
-            z.writestr(f"ppt/notesSlides/notesSlide{i}.xml", _notes_slide_xml(page))
-            z.writestr(f"ppt/notesSlides/_rels/notesSlide{i}.xml.rels", _notes_slide_rels(i))
+            _zwrite(z, f"ppt/slides/slide{i}.xml", _slide_xml(page))
+            _zwrite(z, f"ppt/slides/_rels/slide{i}.xml.rels", _slide_rels(i))
+            _zwrite(z, f"ppt/notesSlides/notesSlide{i}.xml", _notes_slide_xml(page))
+            _zwrite(z, f"ppt/notesSlides/_rels/notesSlide{i}.xml.rels", _notes_slide_rels(i))
 
 
 # ---------------------------------------------------------------------------
