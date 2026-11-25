@@ -664,6 +664,152 @@ def _pick_layout(probe, role):
     return layouts[0] if title_role else layouts[min(1, len(layouts) - 1)]
 
 
+def _graft_template(out_dir, probe, ir):
+    """Point deck.pptx at the template's master / layouts / theme (real inheritance)."""
+    report = {"applied": False, "master": "", "layouts": [], "page_layouts": [],
+              "media": [], "notes": []}
+    probe["graft"] = report
+    deck = os.path.join(out_dir, "deck.pptx")
+    tpl = find_template(os.environ.get("SK_INPUT_DIR", "") or "")
+    if not (tpl and os.path.isfile(tpl) and os.path.isfile(deck)):
+        report["notes"].append("no template file or no deck.pptx in this run; master/layout "
+                               "inheritance is not applicable (built-in OOXML recorded instead)")
+        return probe
+    tmp = deck + ".graft.tmp"
+    try:
+        with zipfile.ZipFile(tpl) as tz, zipfile.ZipFile(deck) as dz:
+            parts = {}
+            for name in tz.namelist():
+                if re.match(r"ppt/(slideMasters|slideLayouts|theme|media)/", name):
+                    parts[name] = tz.read(name)
+            if "ppt/slideMasters/slideMaster1.xml" not in parts:
+                report["notes"].append("template master is not slideMaster1.xml; graft skipped")
+                return probe
+            layouts = sorted(n for n in parts
+                             if re.match(r"ppt/slideLayouts/slideLayout\d+\.xml$", n))
+            chosen = {}
+            for page in ir["pages"]:
+                lay = _pick_layout(probe, page["role"]) or {}
+                name = "ppt/slideLayouts/" + (lay.get("layout") or "slideLayout1.xml")
+                if name not in parts:
+                    name = layouts[0] if layouts else ""
+                chosen[page["index"]] = name
+                report["page_layouts"].append({
+                    "page": page["index"], "role": page["role"],
+                    "layout": os.path.basename(name) if name else "",
+                    "layout_name": lay.get("name", "")})
+            if not layouts:
+                report["notes"].append("template carries no slide layout; graft skipped")
+                return probe
+            with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as out:
+                for name in dz.namelist():
+                    blob = dz.read(name)
+                    if name in parts:
+                        continue
+                    if name == "[Content_Types].xml":
+                        blob = _content_types_with_tpl(blob, parts)
+                    m = re.match(r"ppt/slides/_rels/slide(\d+)\.xml\.rels$", name)
+                    if m:
+                        target = chosen.get(int(m.group(1)))
+                        if target:
+                            blob = blob.decode("utf-8").replace(
+                                "../slideLayouts/slideLayout1.xml",
+                                "../" + target.replace("ppt/", "")).encode("utf-8")
+                    _zw(out, name, blob)
+                for name, blob in parts.items():
+                    _zw(out, name, blob)
+            with zipfile.ZipFile(tmp) as check:
+                bad = check.testzip()
+                names = set(check.namelist())
+            need = ["ppt/slideMasters/slideMaster1.xml", "ppt/theme/theme1.xml"] + layouts[:1]
+            if bad or not all(n in names for n in need):
+                raise ValueError("grafted package failed its structural check")
+        os.replace(tmp, deck)
+        report.update({"applied": True, "master": "slideMaster1.xml",
+                       "layouts": [os.path.basename(n) for n in layouts],
+                       "media": sorted(os.path.basename(n) for n in parts
+                                       if n.startswith("ppt/media/"))})
+        report["notes"].append(
+            "deck.pptx now references the supplied template's master, one of its layouts per "
+            "slide and its theme part; page text stays in text boxes because the template's "
+            "placeholder geometry differs (each page's layout and role are recorded above).")
+    except Exception as exc:  # noqa: BLE001 - never ship a broken deck
+        if os.path.isfile(tmp):
+            os.remove(tmp)
+        report["notes"].append("graft not applied (%s: %s); original deck kept"
+                               % (type(exc).__name__, str(exc)[:160]))
+    return probe
+
+
+def _zw(z, name, blob):
+    """Fixed-timestamp zip write so the grafted deck stays byte-identical across runs."""
+    info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+    info.compress_type = zipfile.ZIP_DEFLATED
+    zipfile.ZipFile.writestr(z, info, blob)
+
+
+def _refresh_deck_hash(result, out_dir):
+    """Re-state deck.pptx's sha256/size after the graft, so recorded hashes match the file."""
+    path = os.path.join(out_dir, "deck.pptx")
+    if not os.path.isfile(path):
+        return
+    digest = _sha(path)
+    size = os.path.getsize(path)
+
+    def walk(node):
+        if isinstance(node, dict):
+            name = str(node.get("filename") or node.get("file") or node.get("path") or "")
+            if name.endswith("deck.pptx") and "sha256" in node:
+                node["sha256"] = digest
+                if "bytes" in node:
+                    node["bytes"] = size
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(result)
+
+
+def _content_types_with_tpl(blob, parts):
+    """Extend [Content_Types].xml with the parts copied from the template."""
+    text = blob.decode("utf-8")
+    types = {
+        "ppt/slideMasters/": "application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml",
+        "ppt/slideLayouts/": "application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml",
+        "ppt/theme/": "application/vnd.openxmlformats-officedocument.theme+xml",
+    }
+    add = []
+    for name in sorted(parts):
+        if not name.endswith(".xml"):
+            continue
+        for prefix, ctype in types.items():
+            if name.startswith(prefix) and ('PartName="/%s"' % name) not in text:
+                add.append('<Override PartName="/%s" ContentType="%s"/>' % (name, ctype))
+                break
+    exts = {}
+    for name in parts:
+        if name.startswith("ppt/media/"):
+            ext = os.path.splitext(name)[1].lstrip(".").lower()
+            if ext and ('Extension="%s"' % ext) not in text:
+                exts[ext] = ("image/png" if ext == "png" else
+                             "image/jpeg" if ext in ("jpg", "jpeg") else
+                             "image/gif" if ext == "gif" else
+                             "image/svg+xml" if ext == "svg" else "application/octet-stream")
+    add += ['<Default Extension="%s" ContentType="%s"/>' % (k, v) for k, v in sorted(exts.items())]
+    if not add:
+        return blob
+    return text.replace("</Types>", "".join(add) + "</Types>").encode("utf-8")
+
+
+def _deck_layout(probe, page_index):
+    for row in ((probe.get("graft") or {}).get("page_layouts") or []):
+        if row.get("page") == page_index:
+            return row.get("layout", "")
+    return ""
+
+
 def _rule_map(ir, probe):
     rows = []
     fonts = (probe.get("theme") or {}).get("fonts") or {}
@@ -692,7 +838,9 @@ def _rule_map(ir, probe):
                 "rationale": "role '%s' mapped to template layout '%s' by name match; slide size, "
                              "theme fonts and theme colours inherited into the generated OOXML."
                              % (page["role"], layout.get("name") or layout.get("layout")),
-                "inheritance": "real_partial",
+                "inheritance": ("real" if (probe.get("graft") or {}).get("applied")
+                                else "real_partial"),
+                "deck_layout": _deck_layout(probe, page["index"]),
             })
         else:
             rows.append({
@@ -828,12 +976,15 @@ def _inject_result(out_dir, result_path, ir, probe, check, verify, consistency,
         return
     if not isinstance(result, dict):
         return
+    _refresh_deck_hash(result, out_dir)
     _evidence_alias(result)
     extras = {
         "template": {"file": probe.get("path", ""),
                      "report": "template_report.json",
-                     "inheritance": ("real_partial" if probe.get("template_provided")
-                                     else "builtin_ooxml_standalone")},
+                     "inheritance": ("real" if (probe.get("graft") or {}).get("applied")
+                                     else "real_partial" if probe.get("template_provided")
+                                     else "builtin_ooxml_standalone"),
+                     "master_layout_graft": probe.get("graft") or {}}, 
         "deck": {"file": "deck.pptx", "slides": len(ir["pages"])},
         "template_rule_map": rule_map,
         "font_color_layout_mapping": mapping,
@@ -878,6 +1029,7 @@ def finalize(out_dir, _result_path=None):
     if not isinstance(probe, dict) or "template_provided" not in probe:
         probe = probe_template(find_template(os.path.dirname(out_dir)))
     ir = build_ir(result, probe, out_dir)
+    probe = _graft_template(out_dir, probe, ir)
     if not ir["pages"]:
         _dump(out_dir, "template_probe.json", probe)
         return {"skipped": "no page plan in result.json"}
