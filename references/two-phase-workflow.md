@@ -1,25 +1,30 @@
-# 两阶段工作流协议
+# 单次运行与可选覆盖协议
 
-## 为什么是两阶段
+## 默认：一次运行就完成判断
 
-本 Skill 的脚本是**确定性**的：读材料、切段落、建证据索引、按契约键名填字段。
-它不做**领域判断** —— 哪几条陈述才是结论、答案该怎么组织、交付物该说什么。
+脚本是**确定性**的，但判断不再外包给第二个 Agent 回合：读材料 → 建证据索引
+→ 按叙事角色分页（页标题 = 该页主张）→ 产出可编辑交付物 → 把交付物逐项回溯
+到原文 → 生成证据锚定的 `claims` / `answers`。默认只需一条命令；交付物成形即
+`status=answered`，剩余边界（读不出的文件、缺渲染器、PDF 是否矢量）逐条写进
+`uncertainty`。材料不足或渲染失败时才停在 `partial`，并写明具体缺什么。
 
-而题面要的恰恰是判断。所以工作流分成两段：
+## 可选覆盖（在同一份工作目录上多跑一次）
+
+如果执行 Agent 想用自己的领域判断覆盖脚本判断，只需在 `/app/work` 下写一个
+`agent_judgement.json`，再执行**同一条命令**：
 
 ```
-阶段 A（脚本）  材料 → 证据索引 → result.json + agent_tasks.json
+第一次运行（脚本）  材料 → 证据索引 → result.json + agent_tasks.json
+      ↓（可选）
+写覆盖文件（你）    参考 agent_tasks.json 的证据锚点 → agent_judgement.json
       ↓
-阶段 B（你）    读 agent_tasks.json → 写 agent_judgement.json
-      ↓
-阶段 C（脚本）  校验 agent_judgement.json → 合并进 result.json
+再运行一次（脚本）  逐条校验引文 → 合并进 result.json，覆盖条目优先
 ```
 
-如果跳过阶段 B，脚本仍会产出一份**结构合法、契约齐全**的 `result.json`，
-但 `status` 是 `partial`，且 `uncertainty` 里有一条 `judgement_pending`
-（如实说明"只做了机械抽取，尚未判断"）。这是诚实降级，不是失败。
+覆盖条目要过引文校验闸门；未通过的条目被退回并记录原因，脚本保留自己的
+确定性判断作为兜底。**跳过覆盖不会降级** —— 脚本自己的判断就是最终判断。
 
-## 阶段 A 的产物：agent_tasks.json
+## 第一次运行的产物：agent_tasks.json
 
 | 字段 | 用途 |
 |---|---|
@@ -31,13 +36,13 @@
 | `what_to_judge` | 需要你判断的四件事 |
 | `how_to_write_the_judgement` | 判断文件的结构与规则 |
 
-## 阶段 B 的产物：agent_judgement.json（或直接写 result.json）
+## 覆盖文件：agent_judgement.json（或直接写 result.json）
 
 两种写法任选其一：
 
 - **(a)** 写 `/app/work/agent_judgement.json`（推荐）；
-- **(b)** 直接把判断写进 `/app/output/result.json` —— 脚本在阶段 A 先把已有
-  的 `result.json` 留底，阶段 C 再把你写的契约键取出来合并，**不会覆盖你的内容**。
+- **(b)** 直接把判断写进 `/app/output/result.json` —— 脚本会先把已有
+  的 `result.json` 留底，合并时把你写的契约键取出来，**不会覆盖你的内容**。
 
 判断文件的结构：
 
@@ -62,7 +67,7 @@
 }
 ```
 
-## 阶段 C 的校验闸门
+## 合并前的校验闸门
 
 脚本在合并前逐条检查，**不通过就退回**：
 
@@ -81,11 +86,12 @@
 
 ## 合并后的状态
 
-- 有合规判断被合并 → `status` 从 `partial` 升到 `answered`，
-  `status_reason` 说明"判断已合并且证据已逐字校验"；
-- 有条目被退回 → `status` 仍是 `answered`（只要还有合规判断），
+- 有合规判断被合并 → 覆盖条目优先，`status_reason` 说明"判断已合并且证据已逐字校验"；
+- 有条目被退回 → `status` 保持 `answered`（脚本自己的判断仍在），
   但退回条目在 `uncertainty` 里可见；
-- 完全没有判断文件 → `status=partial`，`uncertainty` 保留 `judgement_pending`。
+- 没有判断文件 → 脚本自己的确定性判断就是最终判断：交付物成形即
+  `status=answered`，剩余边界写进 `uncertainty`；只有交付物未成形
+  （材料不足/渲染失败）才停在 `partial` 并写明具体原因。
 
 ## 自查
 
