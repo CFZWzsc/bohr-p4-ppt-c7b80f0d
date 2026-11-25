@@ -76,9 +76,10 @@ python /skills/weekly-skill/scripts/sk_entry.py \
 - 材料不足或渲染失败时 `status` 才停在 `partial`，并在 `status_reason`
   写明**具体**缺什么（而不是"等 Agent 判断"）。
 
-**可选覆盖**：执行 Agent 若要给出更强判断，可把
-`/app/work/agent_judgement.json`（结构见 `references/two-phase-workflow.md`）写好后再跑一次；
-脚本逐条校验引文后合并，未通过校验的条目退回并记录原因。不做这一步也不影响交付完整性。
+**单次运行**：判断在本次运行内完成，不存在「先跑一遍、再跑一遍」的两段式。
+执行 Agent 若要给出更强判断，可把 `agent_judgement.json`（结构见
+`references/judgement-override.md`）放进输入目录或 work 目录；脚本在**同一次运行**里
+逐条校验引文后合并，未通过校验的条目退回并记录原因。不提供该文件也不影响交付完整性。
 
 > 判断可以自由，**证据不可以自由**：每条 quote 必须能在材料原文里逐字找回。
 
@@ -187,7 +188,7 @@ python /skills/weekly-skill/scripts/sk_selftest.py --input /input
 
 - `references/evidence-discipline.md` —— 证据与不确定性纪律
 - `references/contract-handling.md` —— 运行时契约的读法与字段语义表
-- `references/two-phase-workflow.md` —— 可选判断覆盖文件的结构与校验闸门
+- `references/judgement-override.md` —— 可选判断覆盖文件的结构（同一次运行内读取与合并）
 - `references/failure-modes.md` —— 常见失败模式与正确退路
 - `references/artifact-pipeline.md` —— 每条赛道真实落盘哪些文件、怎么回挂契约键
 - `assets/result-schema.md` —— `result.json` 的字段说明
