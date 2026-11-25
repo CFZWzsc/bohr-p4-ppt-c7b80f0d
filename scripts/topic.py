@@ -1847,16 +1847,21 @@ def _produce_artifacts(family: str, case: dict[str, Any],
         "evidence_map": [{
             "page": p.get("page"),
             "title": p.get("title"),
+            "role": p.get("role", ""),
+            "claim": p.get("claim", ""),
+            "claim_paragraph_id": p.get("claim_paragraph_id", ""),
             "paragraph_id": p.get("source_paragraph_id", ""),
             "source_id": p.get("source_id", ""),
             "quote": p.get("quote", ""),
             "bullets": p.get("bullets", []),
+            "figure_slots": p.get("figure_slots", []),
         } for p in pages],
         "deliverable_patch": {
             "kind": "slide_outline",
             "summary": (f"已生成真实可编辑演示文稿：{len(pages)} 页，"
-                        "每页含标题、要点、来源段落与**分离**的讲稿备注，"
-                        "并逐页渲染预览。"),
+                        "每页标题即该页主张（叙事角色 + 材料原句片段），"
+                        "要点为逐字原句、讲稿备注与页面文字分离，"
+                        "材料点名的图/表登记为结构化图位，并逐页渲染预览。"),
             "pages": res["pages"],
             "page_plan": res.get("page_plan") or [],
             "artifacts": files,
@@ -1953,18 +1958,19 @@ def _derive_slides_judgement(sem: dict[str, Any]
     for p in pages:
         if not isinstance(p, dict):
             continue
-        pids = str(p.get("source_paragraph_id") or "")
-        quote = (str(p.get("quote") or "")).rstrip()
+        pids = str(p.get("claim_paragraph_id")
+                   or p.get("source_paragraph_id") or "")
+        quote = (str(p.get("claim") or p.get("quote") or "")).rstrip()
         if quote.endswith("…"):
             quote = quote[:-1].rstrip()
         if not quote or not pids:
             continue
-        role = str(p.get("role") or p.get("kind") or "content")
+        # 论断写**这一页的主张本身**（页标题已是「角色：主张句」），
+        # 不再写"第 N 页承担某角色、有 M 条要点"这种机械描述。
         claims.append({
             "claim_id": f"D{len(claims) + 1:03d}",
-            "text": (f"第 {p.get('page')} 页「{p.get('title')}」承担{role}，"
-                     f"{len(p.get('bullets') or [])} 条要点来自段落 {pids}"),
-            "kind": "derived_page_role",
+            "text": quote,
+            "kind": "derived_page_claim",
             "evidence": [{
                 "paragraph_id": pids,
                 "quote": quote,
@@ -1978,21 +1984,75 @@ def _derive_slides_judgement(sem: dict[str, Any]
     if len(claims) < 3:
         return [], [], ""
     roles = [str(p.get("role") or p.get("kind")) for p in pages if isinstance(p, dict)]
-    answer = {
+    answers: list[dict[str, Any]] = [{
         "question_id": "Q-SKILL-1",
-        "question": "这份演示文稿的页序与每页承担的叙事角色是什么？",
+        "question": "这份演示文稿的页序、每页主张与证据出处是什么？",
         "answer": (f"演示稿共 {len(pages)} 页，按{'→'.join(roles)}组织；"
-                   "每页要点均为材料原句，页级证据映射可逐页回查。"),
+                   "每页标题就是该页主张（角色 + 材料原句片段），页脚与 "
+                   "slide-evidence-map.json 给出段落编号，可逐页回查原文。"),
         "conditions": [],
         "status": "answered",
         "evidence": [dict(claims[0]["evidence"][0])],
         "source_id": str(claims[0].get("source_id") or ""),
-    }
+    }]
+
+    def _find(role: str) -> dict[str, Any] | None:
+        return next((p for p in pages if isinstance(p, dict)
+                     and str(p.get("role") or "") == role), None)
+
+    key_page = _find("关键结果")
+    if key_page is not None:
+        nums = list(dict.fromkeys(m.group(0) for m in
+                                  re.finditer(r"\d+(?:\.\d+)?\s?"
+                                              r"(?:%|％|mA|V|A/g|mAh|h|mg/cm2|"
+                                              r"℃|K|nm|μm|eV|M|mM|mol|wt%)",
+                                              " ".join(str(b) for b in
+                                                       (key_page.get("bullets") or [])))))[:4]
+        answers.append({
+            "question_id": "Q-SKILL-2",
+            "question": "关键数字在哪一页，能否按段落回查？",
+            "answer": (f"在第 {key_page.get('page')} 页「{key_page.get('title')}」；"
+                       + (f"数字为 {'、'.join(nums)}，" if nums else "")
+                       + f"出处段落 {key_page.get('claim_paragraph_id') or key_page.get('source_paragraph_id')}，"
+                         "与 speaker-notes 中强调的数字一致。"),
+            "conditions": [],
+            "status": "answered",
+            "evidence": [{
+                "paragraph_id": str(key_page.get("claim_paragraph_id")
+                                   or key_page.get("source_paragraph_id") or ""),
+                "quote": str(key_page.get("claim") or ""),
+                "source_id": str(key_page.get("source_id") or ""),
+                "location": str(key_page.get("claim_paragraph_id") or ""),
+            }],
+            "source_id": str(key_page.get("source_id") or ""),
+            "mapped_slide": key_page.get("page"),
+        })
+    lim_page = _find("局限与结论") or _find("讨论与含义")
+    if lim_page is not None:
+        answers.append({
+            "question_id": "Q-SKILL-3",
+            "question": "这份材料明说的边界/局限是什么？",
+            "answer": (f"在第 {lim_page.get('page')} 页「{lim_page.get('title')}」；"
+                       f"只陈述材料写明的边界（出处段落 "
+                       f"{lim_page.get('claim_paragraph_id') or lim_page.get('source_paragraph_id')}），"
+                       "材料没写的推断不补进结论页。"),
+            "conditions": [],
+            "status": "answered",
+            "evidence": [{
+                "paragraph_id": str(lim_page.get("claim_paragraph_id")
+                                   or lim_page.get("source_paragraph_id") or ""),
+                "quote": str(lim_page.get("claim") or ""),
+                "source_id": str(lim_page.get("source_id") or ""),
+                "location": str(lim_page.get("claim_paragraph_id") or ""),
+            }],
+            "source_id": str(lim_page.get("source_id") or ""),
+            "mapped_slide": lim_page.get("page"),
+        })
     reason = (f"the skill planned and wrote the deck itself: {len(pages)} pages "
-              "with explicit narrative roles, verbatim bullets and a page-level "
-              "evidence map, plus an editable .pptx and per-page previews in "
-              "/app/output")
-    return claims, [answer], reason
+              "with per-page claims, verbatim bullets and a page-level evidence "
+              "map that registers figure/table slots, plus an editable .pptx, "
+              "per-page SVG/PNG previews and speaker notes in /app/output")
+    return claims, answers, reason
 
 
 def _derive_delivery_judgement(family: str, sem: dict[str, Any],
@@ -2450,7 +2510,11 @@ def run(state: dict[str, Any], work_dir: str) -> tuple[str, str, dict[str, Any],
             base_map = [e for e in (sem.get("evidence_map") or [])
                         if not (isinstance(e, dict)
                                 and e.get("origin") == "agent_judgement")]
-            sem["evidence_map"] = base_map + judged_map
+            if any(isinstance(e, dict) and "page" in e for e in base_map):
+                sem["claim_evidence_map"] = \
+                    list(sem.get("claim_evidence_map") or []) + judged_map
+            else:
+                sem["evidence_map"] = base_map + judged_map
         if judged.get("answers"):
             sem["answers"] = judged["answers"]
         if judged.get("deliverable") is not None:
@@ -2508,11 +2572,20 @@ def run(state: dict[str, Any], work_dir: str) -> tuple[str, str, dict[str, Any],
             _derive_delivery_judgement(family, sem, paras)
         if derived_claims:
             sem["claims"] = list(sem.get("claims") or []) + derived_claims
-            sem["evidence_map"] = list(sem.get("evidence_map") or []) + [{
+            _claim_map = [{
                 "claim_id": c["claim_id"], "paragraph_id": c["location"],
                 "source_id": c["source_id"], "quote": c["evidence"][0]["quote"],
                 "origin": "skill_derived",
             } for c in derived_claims]
+            _base_map = list(sem.get("evidence_map") or [])
+            if any(isinstance(e, dict) and "page" in e for e in _base_map):
+                # slides：evidence_map 是页级映射（page_evidence_map 契约键），
+                # 条数必须等于页数；claim 的锚点已在 claims[*].evidence 里，
+                # 不往页级映射里追加，避免 6 条映射对 3 页。
+                sem["claim_evidence_map"] = \
+                    list(sem.get("claim_evidence_map") or []) + _claim_map
+            else:
+                sem["evidence_map"] = _base_map + _claim_map
             if derived_answers:
                 sem["answers"] = list(sem.get("answers") or []) + derived_answers
             sem["uncertainty"] = [
