@@ -275,7 +275,18 @@ def main(argv: list[str] | None = None) -> int:
 
     input_dir, work_dir, out_dir = B.resolve_paths(args)
     try:
-        return run_once(input_dir, work_dir, out_dir)
+        import deckkit as _deckkit
+        _deckkit.pre_apply(input_dir)
+    except Exception:  # noqa: BLE001 - template probe must never block the run
+        pass
+    try:
+        _rc = run_once(input_dir, work_dir, out_dir)
+        try:
+            import deckkit as _deckkit_out
+            _deckkit_out.finalize(out_dir)
+        except Exception:  # noqa: BLE001 - side artefacts are best effort
+            pass
+        return _rc
     except Exception as exc:  # noqa: BLE001 - 最后一层保护
         try:
             B.fail_skeleton(
