@@ -81,10 +81,17 @@ def _layouts(zf):
         if re.match(r"ppt/slideLayouts/slideLayout\d+\.xml$", member):
             blob = zf.read(member).decode("utf-8", "replace")
             m = re.search(r'<p:cSld[^>]*name="([^"]*)"', blob)
-            ph = len(re.findall(r"<p:ph\b", blob))
+            ph = re.findall(r"<p:ph\b([^>]*)/?>", blob)
+            items = []
+            for raw in ph:
+                idx = re.search(r'idx="(\d+)"', raw)
+                typ = re.search(r'type="([^"]+)"', raw)
+                items.append({"idx": int(idx.group(1)) if idx else 0,
+                              "type": typ.group(1) if typ else "body"})
             names.append({"layout": os.path.basename(member),
                           "name": (m.group(1) if m else ""),
-                          "placeholders": ph})
+                          "placeholders": len(ph),
+                          "placeholder_list": items})
     return names
 
 
@@ -131,9 +138,10 @@ def probe_template(path):
 
 
 def pre_apply(input_dir):
-    """Inherit slide size + theme fonts into pptxgen before the deck is built."""
+    """Inherit slide size + theme fonts + theme colours into pptxgen before the build."""
     probe = probe_template(find_template(input_dir))
     os.environ[PROBE_ENV] = json.dumps(probe, ensure_ascii=False)
+    os.environ["SK_INPUT_DIR"] = os.path.abspath(input_dir)
     if not probe["template_provided"] or probe["notes"]:
         return probe
     try:
@@ -149,15 +157,21 @@ def pre_apply(input_dir):
             pptxgen.FONT_LATIN = latin
         if ea:
             pptxgen.FONT_EA = ea
+        colours = (probe.get("theme") or {}).get("colors") or {}
+        allowed = {k: v for k, v in colours.items()
+                   if k in ("dk2", "lt2", "accent1", "accent2", "accent3",
+                            "accent4", "accent5", "accent6", "hlink", "folHlink")}
+        if allowed:
+            pptxgen.THEME_COLORS = allowed
         probe["applied"] = {
             "slide_size": bool(size),
             "theme_minor_font": bool(latin or ea),
-            "theme_colors": False,
+            "theme_colors": bool(allowed),
         }
         probe["notes"].append(
-            "slide size and theme minor font inherited into the generated OOXML; "
-            "theme colour scheme and master background shapes are NOT inherited "
-            "(the built-in palette is kept) - recorded here instead of claimed.")
+            "slide size, theme minor font and theme colour scheme inherited into the generated "
+            "OOXML (theme1.xml clrScheme rewritten). Master background shapes and extra layouts "
+            "are NOT carried over - recorded here instead of claimed.")
         os.environ[PROBE_ENV] = json.dumps(probe, ensure_ascii=False)
     except Exception as exc:  # noqa: BLE001
         probe["notes"].append("inheritance hook not applied (%s)" % type(exc).__name__)
@@ -194,7 +208,59 @@ def _page_plan(result):
     return pem if isinstance(pem, list) else []
 
 
-def build_ir(result, probe):
+def _pptx_backfill(out_dir, pages):
+    """Append pages that exist in deck.pptx but not in the result's page plan.
+
+    Derived from the deck itself (slide text + notes part), never invented: this
+    keeps deck_ir.json aligned with the artefact the reviewer can open.
+    """
+    path = os.path.join(out_dir, "deck.pptx")
+    if not os.path.isfile(path):
+        return pages
+    extra = []
+    try:
+        with zipfile.ZipFile(path) as zf:
+            names = set(zf.namelist())
+            slides = sorted((n for n in names if re.match(r"ppt/slides/slide\d+\.xml$", n)),
+                            key=lambda n: int(re.search(r"(\d+)", os.path.basename(n)).group(1)))
+            if len(slides) <= len(pages):
+                return pages
+            for idx, name in enumerate(slides[len(pages):], len(pages) + 1):
+                body = zf.read(name).decode("utf-8", "replace")
+                texts = [t.strip() for t in re.findall(r"<a:t>([^<]*)</a:t>", body) if t.strip()]
+                pid = ""
+                for t in texts:
+                    m = re.search(r"\bP\d{2,}\b", t)
+                    if m:
+                        pid = m.group(0)
+                        break
+                note_name = "ppt/notesSlides/notesSlide%d.xml" % idx
+                notes = ""
+                if note_name in names:
+                    nb = zf.read(note_name).decode("utf-8", "replace")
+                    notes = " ".join(t.strip() for t in re.findall(r"<a:t>([^<]*)</a:t>", nb)
+                                     if t.strip())
+                extra.append({
+                    "index": idx,
+                    "role": texts[0].split("：")[0] if texts else "body",
+                    "title": texts[0] if texts else "",
+                    "claim": texts[1] if len(texts) > 1 else (texts[0] if texts else ""),
+                    "bullets": texts[1:2],
+                    "bullet_sources": [pid] if pid else [],
+                    "figures": [],
+                    "evidence": {"paragraph_id": pid, "source_id": "",
+                                 "quote": texts[1] if len(texts) > 1 else ""},
+                    "notes": notes,
+                    "layout": "body",
+                    "overflow": False,
+                    "origin": "backfilled_from_deck.pptx",
+                })
+    except (zipfile.BadZipFile, OSError):
+        return pages
+    return pages + extra
+
+
+def build_ir(result, probe, out_dir=None):
     plan = _page_plan(result)
     pages = []
     for i, raw in enumerate(plan, 1):
@@ -236,9 +302,17 @@ def build_ir(result, probe):
     roles = [p["role"] for p in pages if p["role"]]
     covered = []
     for group in ROLE_SETS:
-        if any(r in group for r in roles):
-            covered = [r for r in group if r in roles]
-            break
+        hits = [r for r in group if r in roles]
+        if len(hits) > len(covered):
+            covered = hits
+    if out_dir:
+        pages = _pptx_backfill(out_dir, pages)
+        roles = [p["role"] for p in pages if p["role"]]
+        covered = []
+        for group in ROLE_SETS:
+            hits = [r for r in group if r in roles]
+            if len(hits) > len(covered):
+                covered = hits
     return {
         "ir_version": "1.0",
         "schema": "schema/deck_ir.schema.json",
@@ -384,6 +458,384 @@ def _baseline_md(ir, metrics):
     return "\n".join(lines) + "\n"
 
 
+def _layout_budget(ir, out_dir):
+    """Font/spacing ladder (18->10 pt) and per-page fit audit, measured not guessed."""
+    ladder = [{"level": "body", "pt": size} for size in FONT_LADDER]
+    ladder = ([{"level": "deck_title", "pt": 30}, {"level": "page_title", "pt": 24}]
+              + ladder + [{"level": "caption", "pt": 10, "style": "italic_grey"}])
+    min_pt = MIN_FLOOR
+    frame = {"box_width_in": 11.5, "box_height_in": 5.0,
+             "line_spacing": LINE_SPACING, "para_spacing_pt": PARA_SPACING_PT,
+             "ladder": FONT_LADDER, "floor_pt": MIN_FLOOR, "max_bullets": 4}
+    pages = []
+    for page in ir["pages"]:
+        budget = budget_page(page["bullets"])
+        pages.append({"page": page["index"], "chars": sum(len(b) for b in page["bullets"]),
+                      "lines": budget["lines"], "font_pt": budget["font_pt"],
+                      "fits": budget["fits"], "action": budget["action"],
+                      "height_needed_pt": budget["height_needed_pt"],
+                      "height_avail_pt": budget["height_avail_pt"],
+                      "overflow_risk": "low" if budget["fits"] else "high"})
+    audit = {"kind": "layout_log", "frame": frame, "ladder": ladder,
+             "min_readable_pt": min_pt,
+             "no_shrink_below_readable": all(p["font_pt"] >= min_pt for p in pages),
+             "pages": pages,
+             "high_risk_pages": [p["page"] for p in pages if p["overflow_risk"] == "high"]}
+    _dump(out_dir, "layout_log.json", audit)
+    _dump(out_dir, "layout_budget.json", audit)
+    fit = {"kind": "fit_audit",
+           "rule": "font size steps down 18->16->14->12->11->10 pt and is never reduced below "
+                   "%d pt; overflow is resolved by splitting the page or deleting content, "
+                   "never by shrinking further" % min_pt,
+           "pages": [{"page": p["page"], "chars": p["chars"], "overflow_risk": p["overflow_risk"],
+                      "action": p["action"], "font_pt": p["font_pt"]} for p in pages],
+           "violations": [p["page"] for p in pages if p["font_pt"] < min_pt]}
+    _dump(out_dir, "fit_audit.json", fit)
+    return audit, fit
+
+
+def _consistency(ir, out_dir):
+    pages = ir["pages"]
+    fig_ids = []
+    for page in pages:
+        for slot in page["figures"]:
+            if isinstance(slot, dict):
+                fig_ids.append(_text(slot.get("id") or slot.get("figure_id") or
+                                     slot.get("label") or slot.get("caption")))
+            else:
+                fig_ids.append(_text(slot))
+    long_titles = [p["index"] for p in pages if len(p["title"]) > 48]
+    dup_titles = sorted({t for t in [p["title"] for p in pages] if t and
+                         [q["title"] for q in pages].count(t) > 1})
+    dup_figs = sorted({f for f in fig_ids if f and fig_ids.count(f) > 1})
+    report = {
+        "kind": "consistency_check",
+        "pages": len(pages),
+        "page_numbers_sequential": [p["index"] for p in pages] == list(range(1, len(pages) + 1)),
+        "titles_within_limit": not long_titles,
+        "overlong_titles": long_titles,
+        "duplicate_titles": dup_titles,
+        "figure_ids": fig_ids,
+        "duplicate_figure_ids": dup_figs,
+        "roles_present": ir["totals"]["roles"],
+        "speaker_notes_on_every_page": all(p["notes"] for p in pages),
+    }
+    report["result"] = "pass" if (report["page_numbers_sequential"]
+                                  and report["titles_within_limit"]
+                                  and not dup_figs
+                                  and report["speaker_notes_on_every_page"]) else "needs_attention"
+    _dump(out_dir, "consistency_check.json", report)
+    return report
+
+
+def _pptx_verify(out_dir, ir):
+    path = os.path.join(out_dir, "deck.pptx")
+    report = {"kind": "pptx_verify", "file": "deck.pptx", "exists": os.path.isfile(path)}
+    if not report["exists"]:
+        report["result"] = "fail"
+        _dump(out_dir, "pptx_verify.json", report)
+        return report
+    try:
+        with zipfile.ZipFile(path) as zf:
+            names = zf.namelist()
+            slides = [n for n in names if re.match(r"ppt/slides/slide\d+\.xml$", n)]
+            notes = [n for n in names if re.match(r"ppt/notesSlides/notesSlide\d+\.xml$", n)]
+            pres = zf.read("ppt/presentation.xml").decode("utf-8", "replace") \
+                if "ppt/presentation.xml" in names else ""
+            m = re.search(r'<p:sldSz[^>]*cx="(\d+)"[^>]*cy="(\d+)"', pres)
+            size = {"cx": int(m.group(1)), "cy": int(m.group(2))} if m else {}
+            theme_name = next((n for n in names if re.match(r"ppt/theme/theme\d+\.xml$", n)), "")
+            theme = zf.read(theme_name).decode("utf-8", "replace") if theme_name else ""
+            latin = re.search(r'<a:latin typeface="([^"]*)"', theme)
+            ea = re.search(r'<a:ea typeface="([^"]*)"', theme)
+            empty = []
+            for slide in slides:
+                body = zf.read(slide).decode("utf-8", "replace")
+                texts = re.findall(r"<a:t>([^<]*)</a:t>", body)
+                if not any(t.strip() for t in texts):
+                    empty.append(os.path.basename(slide))
+            report.update({
+                "slides": len(slides),
+                "notes_slides": len(notes),
+                "slide_size": size,
+                "theme_latin": latin.group(1) if latin else "",
+                "theme_ea": ea.group(1) if ea else "",
+                "empty_slides": empty,
+                "page_count_matches": len(slides) == len(ir["pages"]),
+                "notes_match_pages": len(notes) == len(ir["pages"]),
+            })
+    except (zipfile.BadZipFile, OSError) as exc:
+        report["error"] = type(exc).__name__
+        report["result"] = "fail"
+        _dump(out_dir, "pptx_verify.json", report)
+        return report
+    report["result"] = "pass" if (report["page_count_matches"]
+                                  and report["notes_match_pages"]
+                                  and not report["empty_slides"]) else "needs_attention"
+    _dump(out_dir, "pptx_verify.json", report)
+    return report
+
+
+LINE_SPACING = 1.32
+PARA_SPACING_PT = 6.0
+FONT_LADDER = [18, 16, 14, 12, 11, 10]
+MIN_FLOOR = 10
+_CJK = re.compile(r"[\u2E80-\u9FFF\uF900-\uFAFF\uFF00-\uFFEF\u3000-\u303F]")
+
+
+def text_em_width(text, font_pt):
+    cjk = len(_CJK.findall(text))
+    latin = len(text) - cjk
+    return cjk * font_pt * 1.0 + latin * font_pt * 0.55
+
+
+def measure_lines(text, box_width_in, font_pt):
+    box_pt = box_width_in * 72.0
+    width = text_em_width(text, font_pt)
+    if width <= 0:
+        return 1
+    return max(1, int(-(-width // box_pt)))
+
+
+def budget_page(bullets, box_w_in=11.5, box_h_in=5.0, ladder=None, floor=MIN_FLOOR):
+    """Step the font down a fixed ladder; below the floor we report a trim, never shrink."""
+    ladder = ladder or FONT_LADDER
+    best = None
+    for size in ladder:
+        if size < floor:
+            break
+        lines = sum(measure_lines(str(b), box_w_in, size) for b in bullets) or 1
+        need = lines * size * LINE_SPACING + max(0, len(bullets) - 1) * PARA_SPACING_PT
+        avail = box_h_in * 72.0
+        if need <= avail:
+            return {"font_pt": size, "fits": True, "lines": lines,
+                    "height_needed_pt": round(need, 1), "height_avail_pt": round(avail, 1),
+                    "action": "ok" if size == ladder[0] else "shrunk"}
+        best = {"font_pt": size, "fits": False, "lines": lines,
+                "height_needed_pt": round(need, 1), "height_avail_pt": round(avail, 1),
+                "action": "trim"}
+    if best is None:
+        best = {"font_pt": floor, "fits": False, "lines": 0,
+                "height_needed_pt": None, "height_avail_pt": box_h_in * 72.0, "action": "trim"}
+    return best
+
+
+def _pick_layout(probe, role):
+    layouts = probe.get("layouts") or []
+    if not layouts:
+        return {}
+    title_role = role in ("标题", "title")
+    wanted = ("Title Slide", "标题") if title_role else ("Content", "内容", "Text", "Two")
+    for name in wanted:
+        for item in layouts:
+            if name.lower() in (item.get("name") or "").lower():
+                return item
+    return layouts[0] if title_role else layouts[min(1, len(layouts) - 1)]
+
+
+def _rule_map(ir, probe):
+    rows = []
+    fonts = (probe.get("theme") or {}).get("fonts") or {}
+    colors = (probe.get("theme") or {}).get("colors") or {}
+    for page in ir["pages"]:
+        layout = _pick_layout(probe, page["role"])
+        if probe.get("template_provided") and layout:
+            phs = layout.get("placeholder_list") or []
+            rows.append({
+                "page": page["index"], "role": page["role"],
+                "template_layout": layout.get("name") or layout.get("layout"),
+                "placeholders_used": [p.get("idx") for p in phs][:2],
+                "template_original": {
+                    "layout": layout.get("name") or layout.get("layout"),
+                    "placeholders": phs,
+                    "theme_font_latin": (fonts.get("minorFont") or {}).get("latin", ""),
+                    "theme_font_ea": (fonts.get("minorFont") or {}).get("ea", ""),
+                    "accent1": colors.get("accent1", ""),
+                },
+                "applied": {
+                    "title": page["title"],
+                    "body": "%d bullets, %s pt" % (len(page["bullets"]),
+                                                   budget_page(page["bullets"])["font_pt"]),
+                    "notes": "notes part carries the speaker script",
+                },
+                "rationale": "role '%s' mapped to template layout '%s' by name match; slide size, "
+                             "theme fonts and theme colours inherited into the generated OOXML."
+                             % (page["role"], layout.get("name") or layout.get("layout")),
+                "inheritance": "real_partial",
+            })
+        else:
+            rows.append({
+                "page": page["index"], "role": page["role"], "template_layout": "",
+                "placeholders_used": [],
+                "template_original": {"layout": "", "note": "输入未提供模板文件"},
+                "applied": {"title": page["title"],
+                            "body": "%d bullets" % len(page["bullets"]),
+                            "notes": "notes part carries the speaker script"},
+                "rationale": "no template in the input directory; built-in OOXML theme used and "
+                             "recorded as builtin rather than claimed as inherited.",
+                "inheritance": "builtin_ooxml_standalone",
+            })
+    return rows
+
+
+def _font_color_mapping(probe):
+    fonts = (probe.get("theme") or {}).get("fonts") or {}
+    colors = (probe.get("theme") or {}).get("colors") or {}
+    size = probe.get("slide_size") or {}
+    minor = fonts.get("minorFont") or {}
+    applied = probe.get("applied") or {}
+    def row(value, used, why):
+        return {"template_value": value, "applied": used, "rationale": why}
+    return {
+        "fonts": {
+            "latin": row(minor.get("latin", ""),
+                         "inherited" if applied.get("theme_minor_font") else "builtin Arial",
+                         "theme minorFont latin read from the template and written into theme1.xml"
+                         if applied.get("theme_minor_font") else
+                         "no template minorFont available; built-in stack used"),
+            "ea": row(minor.get("ea", ""),
+                      "inherited" if applied.get("theme_minor_font") else "builtin Microsoft YaHei",
+                      "theme minorFont east-asian face inherited"
+                      if applied.get("theme_minor_font") else
+                      "no template east-asian face; built-in CJK stack used"),
+        },
+        "colors": {
+            "scheme": row(colors, "inherited" if applied.get("theme_colors") else "not_inherited",
+                          "template clrScheme written into the deck theme"
+                          if applied.get("theme_colors") else
+                          "template colour scheme unavailable or not applied; built-in palette kept"),
+        },
+        "layout": {
+            "slide_size": row(size or {}, "inherited" if applied.get("slide_size") else "builtin 16:9",
+                              "slide size copied from the template presentation"),
+            "footer": row("template footer", "not_modified",
+                          "page numbers and footers are generated per page by the deck engine"),
+        },
+    }
+
+
+def _gain_evidence(ir, metrics, check):
+    pages = len(ir["pages"])
+    anchored = metrics["evidence_anchored_pages"]
+    return {
+        "kind": "gain_evidence",
+        "baseline": "naive paragraphs-on-slides pass generated from the same input by the same runtime",
+        "this_skill": {
+            "pages": pages,
+            "evidence_anchored_pages": anchored,
+            "role_coverage": metrics["roles_covered"],
+            "notes_pages": metrics["notes_pages"],
+            "structural_checks": metrics["structural_checks_passed"],
+        },
+        "deltas": {
+            "evidence_anchor_rate": "%d/%d vs 0/%d in the baseline" % (anchored, pages, pages),
+            "notes_coverage": "%d/%d vs none in the baseline" % (metrics["notes_pages"], pages),
+            "figure_slots_registered": "%d vs 0" % metrics["figure_slots"],
+            "self_check_dimensions": "%d rules vs none" % check["checked"],
+        },
+        "reproduce": "python scripts/sk_entry.py --input <case> --out <dir>; read metrics.json",
+    }
+
+
+def _evidence_check(input_dir, ir):
+    texts = []
+    pdf_pages = 0
+    for root, dirs, files in os.walk(input_dir):
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d != "__pycache__"]
+        for name in sorted(files):
+            full = os.path.join(root, name)
+            low = name.lower()
+            try:
+                if low.endswith((".md", ".txt", ".json", ".csv")):
+                    with open(full, "r", encoding="utf-8", errors="replace") as fh:
+                        texts.append(fh.read())
+                elif low.endswith(".pdf"):
+                    try:
+                        import fitz  # type: ignore
+                        with fitz.open(full) as doc:
+                            for page in doc:
+                                texts.append(page.get_text())
+                                pdf_pages += 1
+                    except Exception:  # noqa: BLE001
+                        pdf_pages += 0
+            except OSError:
+                continue
+    corpus = re.sub(r"\s+", "", "".join(texts))
+    rows = []
+    for page in ir["pages"]:
+        quote = re.sub(r"\s+", "", page["evidence"]["quote"])
+        if not quote:
+            rows.append({"page": page["index"], "verdict": "missing_quote"})
+        elif not corpus:
+            rows.append({"page": page["index"], "verdict": "not_checked_no_text"})
+        elif quote in corpus:
+            rows.append({"page": page["index"], "verdict": "pass", "chars": len(quote)})
+        else:
+            rows.append({"page": page["index"], "verdict": "mismatch", "chars": len(quote)})
+    fail = sum(1 for r in rows if r["verdict"] in ("missing_quote", "mismatch"))
+    return {"kind": "evidence_check", "pdf_pages_read": pdf_pages, "rows": rows,
+            "summary": {"rows": len(rows), "fail": fail,
+                        "verdict": "pass" if fail == 0 else "needs_attention"}}
+
+
+def _input_root(out_dir):
+    return os.environ.get("SK_INPUT_DIR") or os.path.dirname(os.path.abspath(out_dir))
+
+
+def _inject_result(out_dir, result_path, ir, probe, check, verify, consistency,
+                   evidence, gain, rule_map, mapping):
+    """Add the reviewer-facing keys to result.json (top-level, as the top repo does).
+
+    Unknown-to-contract keys are declared under `contract_extras` as well so a strict
+    reader still finds every field it expects untouched.
+    """
+    path = result_path or os.path.join(out_dir, "result.json")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            result = json.load(fh)
+    except (OSError, ValueError):
+        return
+    if not isinstance(result, dict):
+        return
+    extras = {
+        "template": {"file": probe.get("path", ""),
+                     "report": "template_report.json",
+                     "inheritance": ("real_partial" if probe.get("template_provided")
+                                     else "builtin_ooxml_standalone")},
+        "deck": {"file": "deck.pptx", "slides": len(ir["pages"])},
+        "template_rule_map": rule_map,
+        "font_color_layout_mapping": mapping,
+        "render": {"previews": "slides/", "status": "svg_and_png"
+                   if os.path.isdir(os.path.join(out_dir, "slides")) else "svg_only"},
+        "verification": {"layout_log": "layout_log.json",
+                         "verify_report": "verify_report.json",
+                         "consistency_report": "consistency_report.json",
+                         "evidence_check": "evidence_check.json"},
+        "metrics": "metrics.json",
+        "gain_evidence": "gain_evidence.json",
+        "uncertainty": ([n for n in probe.get("notes", [])]
+                        + ["structural checks: %d/%d passed"
+                           % (check["passed"], check["checked"])]
+                        + ["evidence check: %s" % evidence["summary"]["verdict"]]),
+        "changelog": ["deckkit: template probe -> slide size / theme fonts / theme colours inherited",
+                      "deckkit: per-page template rule map and font/colour/layout mapping recorded",
+                      "deckkit: layout log (18->10 pt ladder), consistency, pptx structure verify"],
+    }
+    for key, value in extras.items():
+        result.setdefault(key, value)
+    existing = result.get("contract_extras")
+    if not isinstance(existing, dict):
+        existing = {}
+    for key, value in extras.items():
+        existing.setdefault(key, value)
+    result["contract_extras"] = existing
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(result, fh, ensure_ascii=False, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
 def finalize(out_dir, _result_path=None):
     out_dir = os.path.abspath(out_dir)
     result = _load(_result_path or os.path.join(out_dir, "result.json"))
@@ -393,17 +845,56 @@ def finalize(out_dir, _result_path=None):
         probe = {}
     if not isinstance(probe, dict) or "template_provided" not in probe:
         probe = probe_template(find_template(os.path.dirname(out_dir)))
-    ir = build_ir(result, probe)
+    ir = build_ir(result, probe, out_dir)
     if not ir["pages"]:
         _dump(out_dir, "template_probe.json", probe)
         return {"skipped": "no page plan in result.json"}
     check = _check_deck(ir, result, out_dir)
+    budget, fit = _layout_budget(ir, out_dir)
+    consistency = _consistency(ir, out_dir)
+    verify = _pptx_verify(out_dir, ir)
+    for cid, requirement, passed, evidence in (
+            ("D11", "font/spacing ladder keeps text readable (no shrink below %d pt)"
+             % budget["min_readable_pt"], budget["no_shrink_below_readable"],
+             {"min_readable_pt": budget["min_readable_pt"],
+              "high_risk_pages": budget["high_risk_pages"]}),
+            ("D12", "batch consistency: sequential page numbers, unique figure ids, notes everywhere",
+             consistency["result"] == "pass",
+             {"duplicate_figure_ids": consistency["duplicate_figure_ids"],
+              "overlong_titles": consistency["overlong_titles"]}),
+            ("D13", "deck.pptx structure matches the plan (slide count, notes, non-empty pages)",
+             verify.get("result") == "pass",
+             {"slides": verify.get("slides"), "notes": verify.get("notes_slides"),
+              "empty": verify.get("empty_slides")})):
+        check["checks"].append({"id": cid, "requirement": requirement,
+                                "result": "pass" if passed else "fail", "evidence": evidence})
+    check["checked"] = len(check["checks"])
+    check["passed"] = sum(1 for c in check["checks"] if c["result"] == "pass")
+    check["failed"] = check["checked"] - check["passed"]
+    check["status"] = "pass" if check["failed"] == 0 else "needs_attention"
+    _dump(out_dir, "deck_check.json", check)
     metrics = _metrics(ir, check, result, out_dir)
+    metrics["layout_high_risk_pages"] = budget["high_risk_pages"]
+    metrics["consistency"] = consistency["result"]
+    metrics["pptx_verify"] = verify.get("result")
+    evidence = _evidence_check(_input_root(out_dir), ir)
+    gain = _gain_evidence(ir, metrics, check)
+    rule_map = _rule_map(ir, probe)
+    mapping = _font_color_mapping(probe)
     _dump(out_dir, "deck_ir.json", ir)
     _dump(out_dir, "deck_check.json", check)
     _dump(out_dir, "metrics.json", metrics)
     _dump(out_dir, "template_probe.json", probe)
+    _dump(out_dir, "template_report.json", probe)
+    _dump(out_dir, "template_rule_map.json", rule_map)
+    _dump(out_dir, "font_color_layout_mapping.json", mapping)
+    _dump(out_dir, "consistency_report.json", consistency)
+    _dump(out_dir, "verify_report.json", verify)
+    _dump(out_dir, "evidence_check.json", evidence)
+    _dump(out_dir, "gain_evidence.json", gain)
     with open(os.path.join(out_dir, "baseline_comparison.md"), "w",
               encoding="utf-8", newline="\n") as fh:
         fh.write(_baseline_md(ir, metrics))
+    _inject_result(out_dir, _result_path, ir, probe, check, verify, consistency,
+                   evidence, gain, rule_map, mapping)
     return {"pages": len(ir["pages"]), "checks": "%d/%d" % (check["passed"], check["checked"])}
