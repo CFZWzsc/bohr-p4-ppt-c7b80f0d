@@ -725,6 +725,11 @@ def _graft_template(out_dir, probe, ir):
             if bad or not all(n in names for n in need):
                 raise ValueError("grafted package failed its structural check")
         os.replace(tmp, deck)
+        try:
+            _align_to_placeholders(deck, {i: parts[chosen[i]] for i in chosen if chosen[i] in parts},
+                                   report)
+        except Exception as exc:  # noqa: BLE001 - alignment is an enhancement
+            report["notes"].append("placeholder alignment skipped (%s)" % type(exc).__name__)
         report.update({"applied": True, "master": "slideMaster1.xml",
                        "layouts": [os.path.basename(n) for n in layouts],
                        "media": sorted(os.path.basename(n) for n in parts
@@ -770,6 +775,98 @@ def _refresh_deck_hash(result, out_dir):
                 walk(value)
 
     walk(result)
+
+
+def _ph_rects(layout_xml):
+    """Rectangles of the first placeholder of each type in a template layout."""
+    rects = {}
+    for block in re.findall(r"<p:sp>.*?</p:sp>", layout_xml, re.S):
+        ph = re.search(r"<p:ph\b([^>]*)/?>", block)
+        if not ph:
+            continue
+        typ = re.search(r'type="([^"]+)"', ph.group(1))
+        typ = typ.group(1) if typ else "body"
+        off = re.search(r'<a:off x="(-?\d+)" y="(-?\d+)"', block)
+        ext = re.search(r'<a:ext cx="(\d+)" cy="(\d+)"', block)
+        if off and ext and typ not in rects:
+            rects[typ] = {"x": int(off.group(1)), "y": int(off.group(2)),
+                          "cx": int(ext.group(1)), "cy": int(ext.group(2))}
+    return rects
+
+
+def _set_rect(xml, shape_name, rect):
+    pattern = re.compile(
+        r'(<p:cNvPr id="\d+" name="%s"/>.*?<a:off x=")\d+(" y=")\d+'
+        r'("/><a:ext cx=")\d+(" cy=")\d+("/>)' % shape_name, re.S)
+    return pattern.sub(
+        lambda m: "%s%d%s%d%s%d%s%d%s" % (m.group(1), rect["x"], m.group(2), rect["y"],
+                                          m.group(3), rect["cx"], m.group(4), rect["cy"],
+                                          m.group(5)), xml, count=1)
+
+
+def _shape_rect(xml, shape_name):
+    m = re.search(r'<p:cNvPr id="\d+" name="%s"/>.*?<a:off x="(\d+)" y="(\d+)"/>'
+                  r'<a:ext cx="(\d+)" cy="(\d+)"/>' % shape_name, xml, re.S)
+    if not m:
+        return None
+    return {"x": int(m.group(1)), "y": int(m.group(2)), "cx": int(m.group(3)), "cy": int(m.group(4))}
+
+
+def _align_to_placeholders(deck, layout_parts, report):
+    """Move each slide's title/body box onto its layout's placeholder rectangles."""
+    with zipfile.ZipFile(deck) as src:
+        order = src.namelist()
+        blobs = {name: src.read(name) for name in order}
+    moved = 0
+    for page, blob in sorted(layout_parts.items()):
+        page_name = "ppt/slides/slide%d.xml" % page
+        if page_name not in blobs:
+            continue
+        rects = _ph_rects(blob.decode("utf-8", "replace"))
+        title = rects.get("title") or rects.get("ctrTitle")
+        body = rects.get("body") or rects.get("obj")
+        xml = blobs[page_name].decode("utf-8")
+        before = xml
+        detail = {"page": page, "placeholder_aligned": False}
+        body_now = _shape_rect(xml, "Body")
+        body_done = False
+        if body and body_now and body["cy"] >= body_now["cy"] * 0.8:
+            xml = _set_rect(xml, "Body", body)
+            body_done = True
+            detail["body_rect"] = body
+        elif body:
+            detail["body_note"] = ("layout body box is smaller than the text needs; "
+                                   "body kept as built")
+        if title:
+            bottom = title["y"] + title["cy"]
+            if body_now and not body_done and bottom + 120000 > body_now["y"]:
+                shifted = {"x": body_now["x"], "y": bottom + 180000,
+                           "cx": body_now["cx"], "cy": body_now["cy"]}
+                if shifted["y"] + shifted["cy"] <= 6858000 - 240000:
+                    xml = _set_rect(xml, "Body", shifted)
+                    detail["body_rect"] = shifted
+                    detail["body_note"] = "body box moved below the template title box"
+                else:
+                    detail["title_note"] = "title box would overlap the body box; kept as built"
+                    title = None
+            if title:
+                xml = _set_rect(xml, "Title", title)
+                detail["title_rect"] = title
+        if xml != before:
+            blobs[page_name] = xml.encode("utf-8")
+            moved += 1
+            detail["placeholder_aligned"] = True
+        for row in report["page_layouts"]:
+            if row.get("page") == page:
+                row.update(detail)
+    tmp = deck + ".align.tmp"
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as out:
+        for name in order:
+            _zw(out, name, blobs[name])
+    os.replace(tmp, deck)
+    report["placeholder_aligned_pages"] = moved
+    report["notes"].append("%d page(s) had their title/body boxes moved onto the template layout's "
+                           "placeholder rectangles" % moved)
 
 
 def _content_types_with_tpl(blob, parts):
