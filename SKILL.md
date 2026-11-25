@@ -76,6 +76,9 @@ python /skills/weekly-skill/scripts/sk_entry.py \
 - 材料不足或渲染失败时 `status` 才停在 `partial`，并在 `status_reason`
   写明**具体**缺什么（而不是"等 Agent 判断"）。
 
+**模板继承**：输入目录提供模板时，`deck.pptx` 直接引用该模板的母版、逐页版式与主题部件，
+母版/版式/占位符继承关系可在文件内逐层核对；未随材料提供的母版图形不伪造。
+
 **单次运行**：判断在本次运行内完成，不存在「先跑一遍、再跑一遍」的两段式。
 执行 Agent 若要给出更强判断，可把 `agent_judgement.json`（结构见
 `references/judgement-override.md`）放进输入目录或 work 目录；脚本在**同一次运行**里
