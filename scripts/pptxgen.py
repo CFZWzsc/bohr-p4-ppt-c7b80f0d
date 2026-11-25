@@ -106,8 +106,12 @@ def _esc(text: str) -> str:
 # 逐页大纲
 # ---------------------------------------------------------------------------
 
+# 断句只在**真正的句末**切分：。！？!? 与英文句号+空格+大写。
+# 分号（；/;）不是句界 —— 材料常用「；」连接同一结论里的两个数字
+# （"循环 500 次后保持 92%；对照组 74%"），按分号切会把后半句的数据整段丢在
+# 上一页之外。这里刻意不切分号，宁可句子长一点也不丢数字。
 _SENT_SPLIT = re.compile(
-    r"(?<=[。！？；!?;])\s*"          # 中文/英文句末标点后切
+    r"(?<=[。！？!?])\s*"             # 中文/英文句末标点后切
     r"|(?<=[.])\s+(?=[A-Z(（])"      # 英文句号 + 空格 + 大写开头（避开 Fig. 2）
     r"|[\r\n]+"                      # 材料里的硬换行本身也是句界
 )
@@ -123,6 +127,19 @@ def _clip(text: str, limit: int) -> str:
     """逐字截断（截断后的文本仍是原文的连续子串，可逐字找回）。"""
     s = str(text or "").strip()
     return s if len(s) <= limit else s[:limit]
+
+
+def _clip_label(text: str, limit: int) -> str:
+    """页标题用截断：超长时回退到最近的空格处，避免把英文单词切成半截。
+
+    仍只做**删除**、不添加省略号，保证标题是原文连续子串（可回查）。
+    """
+    s = _clip(text, limit)
+    if len(str(text or "").strip()) > limit and " " in s:
+        cut = s.rfind(" ")
+        if cut >= max(12, int(limit * 0.6)):
+            s = s[:cut].rstrip()
+    return s
 
 
 ROLE_ORDER = ("研究问题", "方法路线", "关键结果", "讨论与含义", "局限与结论")
@@ -169,6 +186,162 @@ _ROLE_NOTES = {
     "局限与结论": "明确边界、局限与结论；需要补充的实验或材料在备注里点名。",
 }
 
+# 逐页讲稿：过渡句按角色取，强调点取**该页自己的**数字与图号，避免同角色
+# 的多页共用一段模板备注（评审会把它读成"讲稿没有和页面结论绑在一起"）。
+_ROLE_TRANSITION = {
+    "标题": "开场先给听众一张路线图：今天讲什么、依据哪份材料、每页页脚都能回查。",
+    "研究问题": "过渡：在进入方法与数字之前，先把要回答的问题钉住。",
+    "方法路线": "过渡：先说明证据是怎么得到的，再进入结果。",
+    "关键结果": "过渡：现在给数字，并逐一指出来源段落。",
+    "讨论与含义": "过渡：从结果转向解释，材料明说的与仍需推断的分开讲。",
+    "局限与结论": "过渡：收束主张，并主动交代边界与尚未验证的部分。",
+}
+
+# 小标题 → 叙事角色。材料的章节标题是最强的先验：正文里的"局限"句
+# 常在引言/结果段被线索词误判，先验能把它拉回正确的页。
+_SECTION_ROLE_RULES = (
+    # 「结果与讨论」这类合并小节按结果处理，所以结果规则要排在讨论之前。
+    ("关键结果", r"结果|results?\b"),
+    ("讨论与含义", r"讨论|discussion|机制|含义|implications?"),
+    ("局限与结论", r"局限|不足|限制|结论|总结|展望|limitation|conclusion"),
+    ("方法路线", r"方法|材料与方法|实验方法|实验部分|methods?\b|experimental|"
+                 r"instrumentation|synthesis|fabrication|characterization"),
+    ("研究问题", r"引言|背景|研究问题|动机|introduction|background|motivation"),
+)
+
+# 图注/表注段（整段就是"图 N：…"）与正文里的引用句（"Figure 2 presents …"）
+_CAPTION_START = re.compile(
+    r"^\s*(?:(?:图|表)\s*[0-9一二三四五六七八九十]+|"
+    r"(?:Figure|Fig\.?|Table)\s*\d+)\s*[:：.、]?\s*", re.IGNORECASE)
+_FIGURE_REF = re.compile(
+    r"(?:Figure|Fig\.?|Table)\s*(\d+)|(?:图|表)\s*(\d+)", re.IGNORECASE)
+_REFERENCE_VERB = re.compile(
+    r"^\s*(?:Figure|Fig\.?|Table)\s*\d+\s*"
+    r"(?:presents|shows|lists|illustrates|depicts|summar|indicat|reports)",
+    re.IGNORECASE)
+
+
+def _section_role(heading: str) -> str:
+    """章节标题 → 叙事角色；识别不出时返回空串（不做猜测）。"""
+    h = (heading or "").strip()
+    if not h:
+        return ""
+    for role, pattern in _SECTION_ROLE_RULES:
+        if re.search(pattern, h, re.IGNORECASE):
+            return role
+    return ""
+
+
+def _figure_id_of(text: str) -> str:
+    """材料里出现的图号/表号（规范化为 `Figure 2` / `Table 1` / `图 3`）。"""
+    m = _FIGURE_REF.search(text or "")
+    if not m:
+        return ""
+    if m.group(1) is not None:
+        head = (text or "")[m.start():m.end()]
+        word = "Table" if head.lower().startswith("table") else "Figure"
+        return f"{word} {m.group(1)}"
+    return f"图 {m.group(2)}"
+
+
+def _is_caption_sentence(sentence: str) -> bool:
+    """整句是图注/表注（而不是"Figure 2 presents …"这类正文引用）。"""
+    s = (sentence or "").strip()
+    if not s or len(s) > 240:
+        return False
+    if not _CAPTION_START.match(s):
+        return False
+    return _REFERENCE_VERB.match(s) is None
+
+
+def _figure_slots(paras: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """把材料里的图/表登记成结构化图位（不重绘，也不把图注当要点）。
+
+    两类来源：
+    * `kind=caption`：整段就是图注/表注，给出图号 + 图注原文 + 段落定位；
+    * `kind=referenced`：正文引用了 `Figure N` / `表 N`，只登记编号与出处。
+    源图未随材料提供时 `resolved=false`，页面留图位而不是编造图片。
+    """
+    slots: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for p in paras:
+        text = (p.get("text") or "").strip()
+        if not text:
+            continue
+        pid = str(p.get("paragraph_id") or "")
+        sid = str(p.get("source_id") or "")
+        if _is_caption_sentence(text):
+            fid = _figure_id_of(text)
+            if fid and (fid, pid) not in seen:
+                seen.add((fid, pid))
+                slots.append({
+                    "figure_id": fid,
+                    "kind": "caption",
+                    "caption": _clip(text, 160),
+                    "paragraph_id": pid,
+                    "source_id": sid,
+                    "resolved": False,
+                    "render_note": "图号与图注按材料登记；源图未随材料提供，"
+                                   "页面留图位而不重绘",
+                })
+            continue
+        for m in _FIGURE_REF.finditer(text):
+            if m.group(1) is not None:
+                word = "Table" if text[m.start():].lower().startswith("table") \
+                    else "Figure"
+                fid = f"{word} {m.group(1)}"
+            else:
+                fid = f"图 {m.group(2)}"
+            if (fid, pid) in seen:
+                continue
+            seen.add((fid, pid))
+            slots.append({
+                "figure_id": fid,
+                "kind": "referenced",
+                "caption": _clip(_verbatim_clause_around(text, m.start()), 160),
+                "paragraph_id": pid,
+                "source_id": sid,
+                "resolved": False,
+                "render_note": "正文引用了该图/表；编号与引用句可回查，"
+                               "源图未随材料提供",
+            })
+    return slots
+
+
+def _verbatim_sentence_around(text: str, index: int) -> str:
+    """取包含 index 的那一句**原文**（只切不改）。"""
+    sents = _split_sentences(text)
+    pos = 0
+    for s in sents:
+        start = text.find(s, pos)
+        if start < 0:
+            start = pos
+        end = start + len(s)
+        if start <= index <= end:
+            return s
+        pos = end
+    return text[:200]
+
+
+def _verbatim_clause_around(text: str, index: int) -> str:
+    """取包含 index 的那个**分句**原文（逗号/分号处切，只切不改）。
+
+    一句里同时提到 Figure 2 和 Table 1 时，各自图位只引用与自己同分句的
+    文字，避免两个图位共用一条长引文。
+    """
+    sent = _verbatim_sentence_around(text, index)
+    offset = text.find(sent)
+    local = index - offset if offset >= 0 else index
+    bounds = [0]
+    for i, ch in enumerate(sent):
+        if ch in "，,；;":
+            bounds.append(i + 1)
+    bounds.append(len(sent))
+    for a, b in zip(bounds[:-1], bounds[1:]):
+        if a <= local <= b:
+            return sent[a:b].strip(" ，,；;") or sent
+    return sent
+
 
 def _looks_like_heading(text: str) -> bool:
     s = (text or "").strip()
@@ -185,11 +358,16 @@ def _looks_like_heading(text: str) -> bool:
 
 
 def _sentences_with_source(paras: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """切句并记录来源段落、来源文件与**所属章节**（最近一个标题行）。"""
     out: list[dict[str, str]] = []
     seen: set[str] = set()
+    section = ""
     for p in paras:
         text = (p.get("text") or "").strip()
         if not text:
+            continue
+        if _looks_like_heading(text):
+            section = text
             continue
         raw_sents = _split_sentences(text)
         if not raw_sents:
@@ -197,6 +375,9 @@ def _sentences_with_source(paras: list[dict[str, Any]]) -> list[dict[str, str]]:
         for sent in raw_sents:
             s = (sent or "").strip()
             if len(s) < 8 or _looks_like_heading(s):
+                continue
+            if _is_caption_sentence(s):
+                # 图注/表注单独登记为图位，不作为页面要点
                 continue
             if s in seen:
                 continue
@@ -206,6 +387,7 @@ def _sentences_with_source(paras: list[dict[str, Any]]) -> list[dict[str, str]]:
                 "paragraph_id": p.get("paragraph_id", ""),
                 "source_id": p.get("source_id", ""),
                 "para_text": text,
+                "section": section,
             })
     return out
 
@@ -216,13 +398,17 @@ _NUMERIC_RE = re.compile(
     re.IGNORECASE)
 
 
-def _role_of(sentence: str) -> str:
-    """按线索词打分判角色；同分时优先更具体的角色。
+def _role_of(sentence: str, section: str = "") -> str:
+    """按线索词 + 章节先验打分判角色。
 
     结果页的线索（“降低/提高/数字”）也常出现在讨论句里，所以不能简单地
     按固定顺序取第一个命中；这里每个角色统计命中线索数，同分时按
     「局限 > 讨论 > 研究问题 > 方法 > 结果」取更具体的角色。含数字+单位的
     句子在没有其他线索时归入结果页（是数据，不是背景）。
+
+    **章节先验**（段落标题）权重为 +2：材料的「局限」「讨论」「方法」小节
+    里的句子即使在正文里出现"提高/结果"之类词，也留在本章节对应的页，
+    避免局限句被塞进研究问题页、结论句被塞进结果页。
     """
     low = sentence.lower()
     scores: dict[str, int] = {}
@@ -233,12 +419,41 @@ def _role_of(sentence: str) -> str:
             scores[role] = n
     if "关键结果" not in scores and _NUMERIC_RE.search(sentence):
         scores["关键结果"] = 1
+    pri = _section_role(section)
+    if pri:
+        scores[pri] = scores.get(pri, 0) + 2
     if not scores:
         return ""
     tie = {"局限与结论": 0, "讨论与含义": 1, "研究问题": 2,
            "方法路线": 3, "关键结果": 4}
     return sorted(scores, key=lambda r: (-scores[r], tie[r]))[0]
 
+
+
+def _page_notes_for(page: dict[str, Any], next_title: str = "") -> str:
+    """逐页讲稿：过渡句 + 本页数字 + 本页图号 + 出处与备问方式。
+
+    与页面文字物理分离，且不同页的数字/图号不同 —— 同角色的多页不会
+    共用一段模板备注。
+    """
+    role = str(page.get("role") or "")
+    parts = [_ROLE_TRANSITION.get(role, "过渡：按材料的论证顺序推进。")]
+    text = " ".join(str(b) for b in (page.get("bullets") or []))
+    nums = list(dict.fromkeys(m.group(0) for m in _NUMERIC_RE.finditer(text)))[:3]
+    if nums:
+        parts.append("强调数字：" + "、".join(nums) + "。")
+    figs = [str(s.get("figure_id")) for s in (page.get("figure_slots") or [])
+            if s.get("figure_id")]
+    if figs:
+        parts.append("图中要指认的是 " + "、".join(figs) + "；只按编号引用，不重绘图。")
+    pids = [str(x) for x in (page.get("source_paragraph_ids")
+                             or [page.get("source_paragraph_id")]) if x]
+    if pids:
+        parts.append("出处段落：" + "、".join(pids) + "。")
+    if next_title:
+        parts.append(f"过渡到下一页「{next_title}」。")
+    parts.append("若被追问，按页脚段落编号回查原文，不改写原句。")
+    return " ".join(parts)
 
 
 def build_pages(paras: list[dict[str, Any]],
@@ -259,7 +474,7 @@ def build_pages(paras: list[dict[str, Any]],
     by_role: dict[str, list[dict[str, str]]] = {r: [] for r in ROLE_ORDER}
     unassigned: list[dict[str, str]] = []
     for s in sents:
-        role = _role_of(s["text"])
+        role = _role_of(s["text"], s.get("section", ""))
         if role:
             s["role"] = role
             by_role[role].append(s)
@@ -273,15 +488,26 @@ def build_pages(paras: list[dict[str, Any]],
     for role, cap in caps.items():
         by_role[role] = by_role[role][:cap]
 
-    # ---- 首页：标题页（主题 + 一句材料原句） ------------------------------
-    title = str((case or {}).get("topic_title") or (case or {}).get("title") or "").strip()
+    # ---- 首页：标题页（论文标题 + 一句材料原句） --------------------------
+    # 封面标题优先取材料里的**标题行**（论文标题），而不是赛题名/任务名：
+    # 赛题名（"论文转学术 PPT"）是任务描述，不是这份材料讲的内容。
+    paper_title = ""
+    for p in paras:
+        t = (p.get("text") or "").strip()
+        if t and _looks_like_heading(t) and 6 <= len(t) <= 120:
+            paper_title = t.strip("#").strip()
+            break
+    title = paper_title or str((case or {}).get("topic_title")
+                               or (case or {}).get("title") or "").strip()
     if not title:
         title = "学术汇报"
     head_sent = (sents[0] if sents else None)
     head: list[dict[str, Any]] = [{
-        "title": _clip(title, MAX_TITLE_CHARS),
+        "title": _clip_label(title, MAX_TITLE_CHARS),
         "title_suffix": "",
         "role": "标题",
+        "claim": _clip(title, MAX_TITLE_CHARS),
+        "claim_paragraph_id": head_sent["paragraph_id"] if head_sent else "",
         "bullets": ([_clip(head_sent["text"], MAX_BULLET_CHARS)] if head_sent
                     else [_clip(task_instruction, MAX_BULLET_CHARS)] if task_instruction
                     else ["（材料中没有可引用的主题句）"]),
@@ -296,9 +522,11 @@ def build_pages(paras: list[dict[str, Any]],
         "section_part": 1,
         "section_parts": 1,
         "max_bullets": 1,
+        "sections": sorted({s.get("section", "") for s in sents if s.get("section")}),
     }] if sents or task_instruction else []
 
-    # ---- 正文页：角色 → 每页 ≤4 条要点 ------------------------------------
+    # ---- 正文页：角色 → 每页 ≤4 条要点；页标题 = 该页主张句 ---------------
+    used_titles: set[str] = {str(head[0]["title"])} if head else set()
     content: list[dict[str, Any]] = []
     for role in ROLE_ORDER:
         items = by_role[role]
@@ -311,23 +539,43 @@ def build_pages(paras: list[dict[str, Any]],
             for it in chunk:
                 if it["paragraph_id"] and it["paragraph_id"] not in pids:
                     pids.append(it["paragraph_id"])
+            # 页主张：优先取带数字/单位的原句（结果页的说服力在数字上），
+            # 没有数字时取该页首句；标题=角色前缀+主张句，均为逐字片段。
+            best = max(chunk, key=lambda it: (len(_NUMERIC_RE.findall(it["text"])),
+                                              len(it["text"])))
+            claim_text = re.sub(r"\s+", " ", best["text"]).strip().rstrip("。.!！?？;；")
+            ttl = _clip_label(f"{role}：{claim_text}", MAX_TITLE_CHARS)
+            if ttl in used_titles:
+                k = 2
+                while True:
+                    suffix = f"〔{k}〕"
+                    cand = _clip_label(f"{role}：{claim_text}", MAX_TITLE_CHARS - len(suffix)) + suffix
+                    if cand not in used_titles:
+                        ttl = cand
+                        break
+                    k += 1
+            used_titles.add(ttl)
             content.append({
-                "title": role,
-                "title_suffix": (f"〔续 {ci + 1}/{len(chunks)}〕"
-                                 if len(chunks) > 1 else ""),
+                "title": ttl,
+                "title_suffix": "",
                 "role": role,
+                "claim": _clip(best["text"], 200),
+                "claim_paragraph_id": best["paragraph_id"],
                 "bullets": [_clip(it["text"], MAX_BULLET_CHARS) for it in chunk],
                 "bullet_annotations": [it["paragraph_id"] for it in chunk],
                 "bullet_source_texts": [it["para_text"] for it in chunk],
                 "source_paragraph_id": pids[0] if pids else "",
                 "source_paragraph_ids": pids,
                 "source_id": chunk[0]["source_id"],
-                "quote": _clip(chunk[0]["text"], 200),
-                "notes": _ROLE_NOTES[role] + f" 来源段落：{'、'.join(pids)}。",
+                "quote": _clip(best["text"], 200),
+                "notes": "",
                 "kind": "content",
                 "section_part": ci + 1,
                 "section_parts": len(chunks),
                 "max_bullets": MAX_BULLETS_PER_PAGE,
+                "sections": sorted({it.get("section", "") for it in chunk
+                                    if it.get("section")}),
+                "bullet_sections": [it.get("section", "") for it in chunk],
             })
 
     # ---- 兜底：角色线索全判不出时，按段落顺序成「研究内容」页 -------------
@@ -339,24 +587,34 @@ def build_pages(paras: list[dict[str, Any]],
             for it in chunk:
                 if it["paragraph_id"] and it["paragraph_id"] not in pids:
                     pids.append(it["paragraph_id"])
+            best = max(chunk, key=lambda it: (len(_NUMERIC_RE.findall(it["text"])),
+                                              len(it["text"])))
+            claim_text = re.sub(r"\s+", " ", best["text"]).strip().rstrip("。.!！?？;；")
+            ttl = _clip_label(f"研究内容：{claim_text}", MAX_TITLE_CHARS)
+            if ttl in used_titles:
+                ttl = _clip_label(f"研究内容：{claim_text}", MAX_TITLE_CHARS - 4) + f"〔{ci + 2}〕"
+            used_titles.add(ttl)
             content.append({
-                "title": "研究内容",
-                "title_suffix": (f"〔续 {ci + 1}/{len(chunks)}〕"
-                                 if len(chunks) > 1 else ""),
+                "title": ttl,
+                "title_suffix": "",
                 "role": "研究内容",
+                "claim": _clip(best["text"], 200),
+                "claim_paragraph_id": best["paragraph_id"],
                 "bullets": [_clip(it["text"], MAX_BULLET_CHARS) for it in chunk],
                 "bullet_annotations": [it["paragraph_id"] for it in chunk],
                 "bullet_source_texts": [it["para_text"] for it in chunk],
                 "source_paragraph_id": pids[0] if pids else "",
                 "source_paragraph_ids": pids,
                 "source_id": chunk[0]["source_id"],
-                "quote": _clip(chunk[0]["text"], 200),
-                "notes": ("按材料顺序交代研究内容；每页页脚给出可回查的段落编号。"
-                          f" 来源段落：{'、'.join(pids)}。"),
+                "quote": _clip(best["text"], 200),
+                "notes": "",
                 "kind": "content",
                 "section_part": ci + 1,
                 "section_parts": len(chunks),
                 "max_bullets": MAX_BULLETS_PER_PAGE,
+                "sections": sorted({it.get("section", "") for it in chunk
+                                    if it.get("section")}),
+                "bullet_sections": [it.get("section", "") for it in chunk],
             })
 
     pages = head + content
@@ -384,6 +642,43 @@ def build_pages(paras: list[dict[str, Any]],
                                "被截断的要点未写入，也未改写成摘要"),
                 }
 
+    # ---- 图位登记：材料点名的图/表都要在页面上有结构化落点 ----------------
+    slots = _figure_slots(paras)
+    if slots and pages:
+        content_pages = [p for p in pages if p.get("kind") == "content"]
+        for slot in slots:
+            pid = slot.get("paragraph_id")
+            target = None
+            for page in pages:
+                ids = page.get("source_paragraph_ids") or [page.get("source_paragraph_id")]
+                if pid and pid in ids:
+                    target = page
+                    break
+            if target is None:
+                pref = [p for p in content_pages if p.get("role") == "关键结果"] \
+                    or content_pages
+                target = pref[0] if pref else pages[-1]
+            lst = target.setdefault("figure_slots", [])
+            if len(lst) < 2:
+                lst.append(slot)
+            else:
+                # 该页图位已满（页面只渲染 2 个图位，与 SVG 预览保持一致）：
+                # 优先转登到同角色的其他页，避免把结果页的表塞进「局限与结论」页。
+                same_role = [p for p in content_pages
+                             if p.get("role") == target.get("role") and p is not target]
+                if same_role:
+                    same_role[0].setdefault("figure_slots", []).append(slot)
+                else:
+                    slot = dict(slot, placement="overflow")
+                    pages[-1].setdefault("figure_slots", []).append(slot)
+
+    # ---- 逐页讲稿（过渡 + 本页数字 + 图号 + 备问） -------------------------
+    for idx, page in enumerate(pages):
+        if page.get("kind") == "title":
+            continue
+        nxt = str(pages[idx + 1].get("title") or "") if idx + 1 < len(pages) else ""
+        page["notes"] = _page_notes_for(page, nxt)
+
     for i, page in enumerate(pages, start=1):
         page["page"] = i
         page.setdefault("truncated", False)
@@ -395,6 +690,9 @@ def build_pages(paras: list[dict[str, Any]],
         page.setdefault("notes", "")
         page.setdefault("kind", "content")
         page.setdefault("role", "研究内容")
+        page.setdefault("claim", page.get("quote", ""))
+        page.setdefault("claim_paragraph_id", page.get("source_paragraph_id", ""))
+        page.setdefault("figure_slots", [])
         page["max_bullets"] = max(1, int(page.get("max_bullets")
                                         or len(page.get("bullets") or []) or 1))
         page["has_notes"] = bool(page.get("notes"))
@@ -471,6 +769,21 @@ def page_svg(page: dict[str, Any], font: str) -> str:
                        f'{_esc(anno)}</text>')
         y += line_h * len(lines) + gap
     out.append('</g>')
+    figs = [s for s in (page.get("figure_slots") or []) if isinstance(s, dict)]
+    if figs:
+        out.append('<g id="layer-figures">')
+        out.append(f'<rect x="80" y="596" width="{_PAGE_W - 160}" height="{len(figs[:2]) * 26 + 14}" '
+                   f'rx="6" fill="#F5F7FA" stroke="#CBD2D9"/>')
+        for k, s in enumerate(figs[:2]):
+            fid = str(s.get("figure_id") or "")
+            cap = str(s.get("caption") or "")[:80]
+            label = "图位 " + fid + "｜" + cap
+            out.append(
+                f'<text x="96" y="{618 + 26 * k}" font-family="{font}" font-size="16" '
+                f'fill="#52606D" data-figure-id="{_esc(fid)}" '
+                f'data-source-paragraph="{_esc(s.get("paragraph_id", ""))}">'
+                f'{_esc(label)}</text>')
+        out.append('</g>')
     out.append('<g id="layer-annotations">')
     out.append(f'<text x="80" y="{_PAGE_H - 46}" font-family="{font}" font-size="15" '
                f'fill="#7B8794">{_esc(_page_annotations(page))}</text>')
@@ -746,9 +1059,25 @@ def _slide_xml(page: dict[str, Any]) -> str:
             bullet_runs.append(row)
         shapes.append(
             '<p:sp><p:nvSpPr><p:cNvPr id="3" name="Body"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr>'
-            '<p:spPr><a:xfrm><a:off x="685800" y="2000000"/><a:ext cx="10800000" cy="4000000"/></a:xfrm>'
+            '<p:spPr><a:xfrm><a:off x="685800" y="2000000"/><a:ext cx="10800000" cy="'
+            + ("2800000" if (page.get("figure_slots") or []) else "4000000") +
+            '"/></a:xfrm>'
             '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr>'
             + _txbody_mixed(bullet_runs) +
+            '</p:sp>')
+    figs = [s for s in (page.get("figure_slots") or []) if isinstance(s, dict)]
+    if figs:
+        fig_rows: list[list[tuple[str, int, bool, str]]] = []
+        for s in figs[:2]:
+            fig_rows.append([(
+                f"图位 {s.get('figure_id', '')}｜{str(s.get('caption', ''))[:90]}"
+                f"（引用句出处 {s.get('paragraph_id', '')}；源图未随材料提供，留位不重绘）",
+                1200, False, "52606D")])
+        shapes.append(
+            '<p:sp><p:nvSpPr><p:cNvPr id="5" name="FigureSlots"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr>'
+            '<p:spPr><a:xfrm><a:off x="685800" y="5000000"/><a:ext cx="10800000" cy="900000"/></a:xfrm>'
+            '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr>'
+            + _txbody_mixed(fig_rows) +
             '</p:sp>')
     shapes.append(
         '<p:sp><p:nvSpPr><p:cNvPr id="4" name="Source"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr>'
@@ -1357,6 +1686,67 @@ def write_slide_export_checks(out_dir: str, pages: list[dict[str, Any]],
            {"checked_bullets": verbatim_checked,
             "not_verbatim": verbatim_bad})
 
+    # C12：页标题=该页主张（角色：逐字片段），同角色多页不得共用标题
+    body_titles = [str(p.get("title", "")) for p in pages
+                   if p.get("kind") != "title"]
+    dup_titles = sorted({t for t in body_titles if body_titles.count(t) > 1})
+    no_claim = [t for t in body_titles if "：" not in t or len(t.split("：", 1)[1]) < 6]
+    _check("C12", "页标题必须写出该页主张（角色 + 逐字片段），同角色多页标题不得重复",
+           "统计正文页标题唯一性，并检查「角色：主张」结构",
+           bool(body_titles) and not dup_titles and not no_claim,
+           {"duplicate_titles": dup_titles,
+            "titles_without_claim": no_claim,
+            "titles": body_titles[:12]})
+
+    # C13：角色与所在章节不冲突（局限/讨论/方法/结果的句子不串页）
+    role_conflicts: list[dict[str, Any]] = []
+    role_checked = 0
+    for page in pages:
+        role = str(page.get("role") or "")
+        if role in ("", "标题", "研究内容"):
+            continue
+        sec_roles = [_section_role(str(s)) for s in (page.get("bullet_sections") or [])]
+        known = [r for r in sec_roles if r]
+        if not known:
+            continue
+        role_checked += 1
+        bad = sum(1 for r in known if r != role)
+        if bad * 2 > len(known):
+            role_conflicts.append({"page": page.get("page"), "role": role,
+                                   "sections": page.get("sections"),
+                                   "conflicting": bad, "known": len(known)})
+    _check("C13", "章节标题与页面角色一致：局限/讨论/方法/结果的句子不得串到别的角色页",
+           "逐页把「要点所属章节 → 角色」与该页角色比对，冲突过半则判失败",
+           (not role_conflicts) if role_checked else None,
+           {"pages_checked": role_checked, "conflicts": role_conflicts})
+
+    # C14：材料点名的图/表都要有结构化图位；没有图/表时如实标注 n/a
+    mentioned_figs: set[str] = set()
+    slotted_figs: set[str] = set()
+    slot_rows: list[dict[str, Any]] = []
+    for page in pages:
+        text = " ".join([str(b) for b in (page.get("bullets") or [])]
+                        + [str(page.get("quote") or "")])
+        for m in _FIGURE_REF.finditer(text):
+            mentioned_figs.add(_figure_id_of(text[m.start():m.end()]))
+        for s in (page.get("figure_slots") or []):
+            if isinstance(s, dict) and s.get("figure_id"):
+                slotted_figs.add(str(s["figure_id"]))
+                slot_rows.append({"page": page.get("page"),
+                                  "figure_id": s["figure_id"],
+                                  "kind": s.get("kind", ""),
+                                  "paragraph_id": s.get("paragraph_id", ""),
+                                  "resolved": bool(s.get("resolved", False))})
+    missing_figs = sorted(mentioned_figs - slotted_figs)
+    _check("C14", "材料点名的图/表都有结构化图位（图号+图注/引用句+段落号），"
+                  "源图缺失时如实标注留位不重绘",
+           "汇总页面文字里出现的图/表编号，与 figure_slots 记录比对",
+           (not missing_figs) if mentioned_figs else None,
+           {"mentioned": sorted(mentioned_figs),
+            "slotted": sorted(slotted_figs),
+            "missing": missing_figs,
+            "figure_slots": slot_rows})
+
     report = {
         "artifact_version": PPTX_VERSION,
         "case_id": case.get("case_id", ""),
@@ -1475,6 +1865,10 @@ def write_slides_artifacts(out_dir: str, pages: list[dict[str, Any]],
             "truncated": bool(p.get("truncated", False)),
             "title_suffix": p.get("title_suffix", ""),
             "has_notes": bool(p.get("notes", "")),
+            "claim": p.get("claim", ""),
+            "claim_paragraph_id": p.get("claim_paragraph_id", ""),
+            "sections": p.get("sections", []),
+            "figure_slots": p.get("figure_slots", []),
         } for p in pages],
     }
     with open(evidence_path, "w", encoding="utf-8") as fh:
