@@ -934,6 +934,9 @@ def _font_scheme() -> str:
             '</a:fontScheme>')
 
 
+THEME_COLORS = {}  # template theme overrides: {"accent1": "#RRGGBB", ...}
+
+
 def _theme() -> str:
     def _scheme_colors() -> str:
         pairs = [("dk1", "sysClr", 'val="windowText" lastClr="000000"'),
@@ -948,6 +951,15 @@ def _theme() -> str:
                  ("accent6", "srgbClr", 'val="4C7C9B"'),
                  ("hlink", "srgbClr", 'val="0563C1"'),
                  ("folHlink", "srgbClr", 'val="954F72"')]
+        if THEME_COLORS:
+            merged = []
+            for key, kind, value in pairs:
+                colour = THEME_COLORS.get(key)
+                if colour:
+                    merged.append((key, "srgbClr", 'val="%s"' % colour.lstrip("#").upper()))
+                else:
+                    merged.append((key, kind, value))
+            pairs = merged
         return "".join(f'<a:{k}><a:sysClr {v}/></a:{k}>' if t == "sysClr"
                        else f'<a:{k}><a:srgbClr {v}/></a:{k}>'
                        for k, t, v in pairs)
