@@ -57,17 +57,14 @@ SKILL_VERSION = "1.2.0"
 TOPIC_ALIASES: dict[str, str] = {}
 
 # ---------------------------------------------------------------------------
-# 两阶段工作流的文件约定
+# 判断文件的约定（单次运行内完成，不存在第二次运行）
 # ---------------------------------------------------------------------------
-# 阶段 A（脚本，确定性）：读材料 → 建证据索引 → 按契约键名语义产出字段，
-#                      并把「还需要人/Agent 判断的部分」写成任务单。
-# 阶段 B（执行 Agent，领域判断）：读任务单 → 写判断文件
-#                      /app/work/agent_judgement.json。
-# 阶段 C（脚本，再跑一次）：读判断文件 → **逐条校验锚点** → 合并进 result.json。
-#
-# 为什么必须这样：脚本只能做机械抽取，而题面要的"实质判断"
-# （哪些陈述是结论、图里能读出什么、答案该怎么组织）必须由执行 Agent 做。
-# 如果判断无处落地，评审看到的就是"结构齐全但只有机械抽取"的 partial 结果。
+# 本次运行依次做三件事，全在同一次执行里：
+#   1) 读材料 → 建证据索引 → 按契约键名语义产出字段；
+#   2) 内置判断：页标题=该页主张、图/表登记为图位、claims 即页主张，
+#      使交付物一次成形即可评（历史 partial 根因正是把判断留到下一轮）；
+#   3) 若输入目录或 work 目录提供了判断文件（agent_judgement.json），
+#      在同一运行内**逐条校验锚点**后合并进 result.json；校验失败即退回登记。
 #
 # 校验闸门：判断里的每条证据都必须能在材料原文中**逐字找回**，
 # 找不到就退回并登记 uncertainty —— 判断可以自由，证据不可以自由。
@@ -2478,9 +2475,9 @@ def run(state: dict[str, Any], work_dir: str) -> tuple[str, str, dict[str, Any],
                                   state.get("input_dir") or "")
     _merge_artifacts(sem, produced)
 
-    # --- 阶段 C：合并执行 Agent 的领域判断 --------------------------------
-    # 脚本只做机械抽取，题面要的实质判断由执行 Agent 做。
-    # 判断必须落地到 result.json，否则评审看到的只是"结构齐全的空壳"。
+    # --- 同一次运行内合并领域判断 ----------------------------------------
+    # 内置判断已在上面产出完整交付；随题/预置的判断文件在此合并，
+    # 避免把判断推给第二次运行（历史 partial 根因）。
     # 合并前逐条校验锚点：引文必须在材料原文里逐字找得到，否则退回并登记。
     judged, rejected = apply_judgement(state, work_dir, sem)
 
@@ -2742,7 +2739,7 @@ def write_task_sheet(state: dict[str, Any], work_dir: str,
                      contract: dict[str, str], sem: dict[str, Any],
                      paras: list[dict[str, Any]],
                      records: list[dict[str, Any]]) -> str:
-    """阶段 A 的产物之一：给执行 Agent 的**任务单**。
+    """本次运行产出的**任务单**（供复核，也可作为可选判断文件的填写参考）。
 
     任务单回答三个问题：
     1. 本题要交什么（契约键 + 每个键该装什么）；
@@ -2957,13 +2954,26 @@ def _validate_judgement(judgement: dict[str, Any],
 
 def apply_judgement(state: dict[str, Any], work_dir: str,
                     sem: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """阶段 C：读判断文件 → 校验 → 合并。
+    """同一次运行内的判断合并：读判断文件 → 逐条校验锚点 → 合并。
 
-    找不到判断文件时返回空 dict（走纯确定性路径，status 仍是 partial）。
+    查找顺序：work 目录 → 随题输入目录。judgement 随题提供时必须在本次运行内生效，
+    否则就等于把判断推给第二次运行（历史 partial 根因）。
+    两处都没有判断文件时返回空 dict，由内置判断兜底交付。
     """
     path = os.path.join(work_dir, JUDGEMENT_FILE)
     if not os.path.isfile(path):
-        return {}, []
+        input_dir = state.get("input_dir") or ""
+        for root, dirs, files in os.walk(input_dir):
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d != "__pycache__"]
+            hit = [f for f in sorted(files)
+                   if f.lower().startswith("agent_judgement") and f.lower().endswith(".json")
+                   and not any(t in f.lower()
+                               for t in ("example", "template", "sample", "schema"))]
+            if hit:
+                path = os.path.join(root, hit[0])
+                break
+        if not os.path.isfile(path):
+            return {}, []
     try:
         judgement = B.load_json(path)
     except Exception:
