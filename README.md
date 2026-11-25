@@ -64,7 +64,7 @@ python scripts/sk_entry.py --input examples/demo-case --work /tmp/w --out /tmp/o
 ls -l /tmp/o
 ```
 
-可选：先写 `/tmp/w/agent_judgement.json` 再跑同一条命令，脚本会校验引文后合并。
+可选：把 `agent_judgement.json` 放进输入目录（或预置到 work 目录），同一条命令在本次运行内校验引文后合并；不需要第二次运行。
 
 ## 自检
 
