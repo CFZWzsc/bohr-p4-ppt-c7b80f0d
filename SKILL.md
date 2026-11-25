@@ -66,47 +66,21 @@ python /skills/weekly-skill/scripts/sk_entry.py \
 ```
 
 - **幻灯片家族**：页面按叙事角色成页（研究问题 / 方法路线 / 关键结果 /
-  讨论与含义 / 局限与结论），页标题就是该页承担的角色；判不出角色的句子
-  按段落顺序兜底成「研究内容」页。
-- **判断内置**：每条 claim 由本 Skill 生成（页级角色 + 要点 + 段落 id + 逐字短引），
+  讨论与含义 / 局限与结论），**页标题 = 该页主张**（角色前缀 + 材料原句片段），
+  同角色多页标题不重复；判不出角色的句子按段落顺序兜底成「研究内容」页。
+- **图位**：材料点名的图/表登记为结构化图位（图号 + 图注/引用句 + 段落号），
+  源图未随材料提供时留图位并标注不重绘，不编造图片。
+- **判断内置**：每条 claim 就是该页主张本身（页级主张 + 段落 id + 逐字短引），
   交付物成形即 `status=answered`；真正的边界（运行时无 PDF 转换器、材料不足）
   逐条写入 `uncertainty`。
 - 材料不足或渲染失败时 `status` 才停在 `partial`，并在 `status_reason`
   写明**具体**缺什么（而不是"等 Agent 判断"）。
 
-**可选覆盖**（只有执行 Agent 想给出更强判断时才需要）：把判断写到
-`/app/work/agent_judgement.json`，或直接改 `/app/output/result.json`，再跑一次；
-脚本会逐条校验引文后合并，未通过校验的条目退回并记录原因。判断文件结构：
+**可选覆盖**：执行 Agent 若要给出更强判断，可把
+`/app/work/agent_judgement.json`（结构见 `references/two-phase-workflow.md`）写好后再跑一次；
+脚本逐条校验引文后合并，未通过校验的条目退回并记录原因。不做这一步也不影响交付完整性。
 
-```json
-{
-  "case_id": "必须与 case.json 一致",
-  "claims": [
-    {"text": "你判断为结论的陈述",
-     "evidence": [{"paragraph_id": "P002", "quote": "原文里逐字出现的片段"}]}
-  ],
-  "answers": [
-    {"question": "被问的问题", "answer": "你的回答",
-     "evidence": [{"paragraph_id": "P002", "quote": "原文里逐字出现的片段"}]}
-  ],
-  "deliverable": "本题最终交付物的正文",
-  "contract_fields": {"契约键名": "该键的内容（可选，直接填契约键）"},
-  "uncertainties": [
-    {"kind": "machine_readable_category", "item": "具体对象",
-     "detail": "客观描述", "resolution": "你做了什么或为何无法继续"}
-  ]
-}
-```
-
-**覆盖时的校验闸门（脚本强制执行）**：
-
-- 每条 `quote` 必须能在材料原文里**逐字找回**（允许空白差异）—— 找不到就**退回**，
-  并把退回理由写进 `uncertainty`；
-- 每条 claim / answer 必须至少有一个证据锚点 —— 没有锚点的条目被退回；
-- `contract_fields` 的值不能是 `null` 或空容器 —— 空值被退回；
-- 被退回的条目**不会**进入最终结果，脚本保留自己的确定性抽取作为兜底。
-
-> 判断可以自由，**证据不可以自由**。这条闸门是本 Skill 的可信度基础。
+> 判断可以自由，**证据不可以自由**：每条 quote 必须能在材料原文里逐字找回。
 
 ### 脚本职责
 
@@ -213,7 +187,7 @@ python /skills/weekly-skill/scripts/sk_selftest.py --input /input
 
 - `references/evidence-discipline.md` —— 证据与不确定性纪律
 - `references/contract-handling.md` —— 运行时契约的读法与字段语义表
-- `references/two-phase-workflow.md` —— 两阶段工作流协议与校验闸门
+- `references/two-phase-workflow.md` —— 可选判断覆盖文件的结构与校验闸门
 - `references/failure-modes.md` —— 常见失败模式与正确退路
 - `references/artifact-pipeline.md` —— 每条赛道真实落盘哪些文件、怎么回挂契约键
 - `assets/result-schema.md` —— `result.json` 的字段说明
